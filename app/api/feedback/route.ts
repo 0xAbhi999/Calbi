@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { getAllFeedback, getFeedbackForStudent } from '@/lib/db'
 import { flushQueuedFeedback, saveFeedbackSubmission } from '@/lib/feedbackStore'
-import { fetchAllFeedback } from '@/lib/persist'
+import { fetchFeedbackForStudent } from '@/lib/persist'
 import { getServerClient } from '@/lib/supabaseServer'
 
 export const runtime = 'nodejs'
@@ -73,15 +73,9 @@ export async function GET(req: Request) {
     const local = getFeedbackForStudent(studentId, email)
     const sb = getServerClient()
     if (sb) {
-      const remote = await fetchAllFeedback(sb)
+      const remote = await fetchFeedbackForStudent(sb, studentId, email)
       if (remote) {
-        const id = studentId.trim().toLowerCase()
-        const mail = email.trim().toLowerCase()
-        const mine = remote.filter((f: any) => {
-          const fId = String(f.student_ref || f.student_id || '').trim().toLowerCase()
-          const fMail = String(f.email || '').trim().toLowerCase()
-          return (id && fId === id) || (mail && fMail === mail)
-        })
+        const mine = remote
         if (mine.length) {
           // Newest first, Supabase preferred, de-duplicated by id.
           const seen = new Set<string>()

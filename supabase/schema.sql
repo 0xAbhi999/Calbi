@@ -132,6 +132,14 @@ create table if not exists public.assessment_results (
   created_at          timestamptz not null default now()
 );
 
+create index if not exists profiles_role_college_idx on public.profiles (role, college);
+create index if not exists assessment_results_student_created_idx
+  on public.assessment_results (student_id, created_at desc);
+create index if not exists assessment_sessions_student_created_idx
+  on public.assessment_sessions (student_id, created_at desc);
+create index if not exists assessment_sessions_status_student_idx
+  on public.assessment_sessions (status, student_id, created_at desc);
+
 -- ---------------------------------------------------------------------------
 -- AI evaluation jobs (CalibiAI) — for speaking/writing/code/prompts
 -- ---------------------------------------------------------------------------
@@ -331,6 +339,10 @@ create index if not exists feedback_submissions_email_idx
   on public.feedback_submissions (lower(email));
 create index if not exists feedback_submissions_created_at_idx
   on public.feedback_submissions (created_at desc);
+create index if not exists feedback_submissions_student_ref_created_idx
+  on public.feedback_submissions (student_ref, created_at desc);
+create index if not exists feedback_submissions_email_created_idx
+  on public.feedback_submissions (lower(email), created_at desc);
 
 alter table public.feedback_submissions enable row level security;
 
@@ -377,3 +389,21 @@ create policy help_requests_insert_any on public.help_requests
 drop policy if exists help_requests_select_own on public.help_requests;
 create policy help_requests_select_own on public.help_requests
   for select using (student_id = auth.uid());
+
+-- ---------------------------------------------------------------------------
+-- Low-egress admin change probe (migration 0007)
+-- ---------------------------------------------------------------------------
+create or replace view public.admin_change_probe
+with (security_invoker = on)
+as
+select
+  (select count(*)::int from public.profiles where role = 'student') as profiles_count,
+  (select count(*)::int from public.assessment_results) as results_count,
+  (select count(*)::int from public.resume_analyses) as resumes_count,
+  (select count(*)::int from public.assessment_sessions) as sessions_count,
+  (select count(*)::int from public.feedback_submissions) as feedback_count,
+  (select max(updated_at) from public.profiles where role = 'student') as profiles_stamp,
+  (select max(created_at) from public.assessment_results) as results_stamp,
+  (select max(created_at) from public.resume_analyses) as resumes_stamp,
+  (select max(coalesce(submitted_at, created_at)) from public.assessment_sessions) as sessions_stamp,
+  (select max(created_at) from public.feedback_submissions) as feedback_stamp;

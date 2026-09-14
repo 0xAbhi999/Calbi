@@ -43,7 +43,7 @@ export async function POST(req: Request) {
     // students look like they never took the assessment. A stable id is also
     // required — remapping a demo id on every request would create a new row
     // per save instead of updating the same session.
-    const id = toUuid(body.id) || toUuid(body.session_id) || randomUUID()
+    const id = toUuid(body.id, 'session') || toUuid(body.session_id, 'session') || randomUUID()
     const session: AssessmentSession = {
       id,
       student_id: body.student_id || body.user_id || '',

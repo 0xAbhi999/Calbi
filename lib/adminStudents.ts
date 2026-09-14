@@ -195,23 +195,25 @@ function fromViewRow(r: any, assessmentSession?: any): AdminStudentRow {
 }
 
 /**
- * Columns read from the `student_profiles_full` view. This is every view
- * column EXCEPT the two heavy JSONB blobs the admin never renders
- * (`resume_feedback` and `assessment_ai_feedback`) — skipping them shrinks
- * each row by ~20-40% and the dashboard downloads the whole table, so every
- * byte here is multiplied by the student count on each refresh.
+ * Columns read from the `student_profiles_full` view. This is only the
+ * identity, resume-summary and score fields buildRow actually needs; the two
+ * heavy JSONB blobs the admin never renders (`resume_feedback` and
+ * `assessment_ai_feedback`) plus storage/tenant metadata are excluded. The
+ * dashboard downloads a page repeatedly, so every unnecessary byte is
+ * multiplied by page size and refresh count.
  * (`feedback_rating/message/created_at` from migration 0004 are likewise
  * skipped — feedback is joined explicitly so the dashboard works whether or
  * not that migration has been applied.)
  */
 const VIEW_COLUMNS = [
+  // Only fields used by buildRow / the expanded row are selected. In
+  // particular, do not pull storage keys, avatar config, tenant metadata or
+  // the view's heavy AI-feedback JSONB column into every admin page.
   'student_id', 'email', 'role', 'full_name', 'prn', 'phone', 'dob', 'gender',
-  'degree', 'college', 'institution_id', 'graduation_year', 'cgpa', 'skills',
-  'linkedin_url', 'github_url', 'ai_avatar', 'profile_created_at',
-  'profile_updated_at', 'resume_id', 'resume_storage_key', 'resume_score',
-  'resume_parsed', 'resume_created_at', 'assessment_session_id', 'talent_score',
-  'grade', 'percentile', 'assessment_scores', 'verifiable_hash',
-  'report_storage_key', 'assessment_created_at',
+  'degree', 'college', 'graduation_year', 'cgpa', 'skills', 'linkedin_url',
+  'github_url', 'profile_created_at', 'resume_score', 'resume_parsed',
+  'assessment_session_id', 'talent_score', 'grade', 'percentile',
+  'assessment_scores', 'verifiable_hash', 'assessment_created_at',
 ].join(',')
 
 /**
@@ -502,36 +504,63 @@ async function latestStamp(sb: any, table: string, col: string): Promise<string>
  * too (free — no Supabase traffic) so seeded/demo edits are also detected.
  * Never throws: degrades to a time-based fingerprint when Supabase is down.
  */
-export async function fetchStudentsFingerprint(): Promise<StudentsFingerprint> {
+async function readStudentsFingerprint(): Promise<StudentsFingerprint> {
   const sb = getServerClient()
   const parts: Record<string, string | number> = { remote: sb ? 1 : 0 }
   const counts = { profiles: -1, results: -1, resumes: -1, feedback: -1 }
   if (sb) {
     try {
-      const [profiles, results, resumes, feedback, pStamp, rStamp, resStamp, fStamp] = await Promise.all([
-        tableCount(sb, 'profiles', true),
-        tableCount(sb, 'assessment_results'),
-        tableCount(sb, 'resume_analyses'),
-        tableCount(sb, 'feedback_submissions'),
-        latestStamp(sb, 'profiles', 'updated_at'),
-        latestStamp(sb, 'assessment_results', 'created_at'),
-        latestStamp(sb, 'resume_analyses', 'created_at'),
-        latestStamp(sb, 'feedback_submissions', 'created_at'),
-      ])
-      counts.profiles = profiles
-      counts.results = results
-      counts.resumes = resumes
-      counts.feedback = feedback
-      parts.profiles = profiles
-      parts.results = results
-      parts.resumes = resumes
-      parts.feedback = feedback
-      parts.pStamp = pStamp
-      parts.rStamp = rStamp
-      parts.resStamp = resStamp
-      parts.fStamp = fStamp
+      // Migration 0007 collapses the old eight count/MAX requests into one
+      // tiny row. The fallback is kept for older projects, but it is cached and
+      // therefore cannot fan out on every admin tab/poll.
+      const compact = await sb.from('admin_change_probe').select('*').limit(1).maybeSingle()
+      if (!compact.error && compact.data) {
+        const d: any = compact.data
+        const profiles = Number(d.profiles_count) || 0
+        const results = Number(d.results_count) || 0
+        const resumes = Number(d.resumes_count) || 0
+        const feedback = Number(d.feedback_count) || 0
+        counts.profiles = profiles
+        counts.results = results
+        counts.resumes = resumes
+        counts.feedback = feedback
+        parts.profiles = profiles
+        parts.results = results
+        parts.resumes = resumes
+        parts.feedback = feedback
+        parts.pStamp = String(d.profiles_stamp || '')
+        parts.rStamp = String(d.results_stamp || '')
+        parts.resStamp = String(d.resumes_stamp || '')
+        parts.fStamp = String(d.feedback_stamp || '')
+        parts.sStamp = String(d.sessions_stamp || '')
+        parts.sessions = Number(d.sessions_count) || 0
+      } else {
+        const [profiles, results, resumes, feedback, pStamp, rStamp, resStamp, fStamp] = await Promise.all([
+          tableCount(sb, 'profiles', true),
+          tableCount(sb, 'assessment_results'),
+          tableCount(sb, 'resume_analyses'),
+          tableCount(sb, 'feedback_submissions'),
+          latestStamp(sb, 'profiles', 'updated_at'),
+          latestStamp(sb, 'assessment_results', 'created_at'),
+          latestStamp(sb, 'resume_analyses', 'created_at'),
+          latestStamp(sb, 'feedback_submissions', 'created_at'),
+        ])
+        counts.profiles = profiles
+        counts.results = results
+        counts.resumes = resumes
+        counts.feedback = feedback
+        parts.profiles = profiles
+        parts.results = results
+        parts.resumes = resumes
+        parts.feedback = feedback
+        parts.pStamp = pStamp
+        parts.rStamp = rStamp
+        parts.resStamp = resStamp
+        parts.fStamp = fStamp
+      }
     } catch {
-      // Fall through — the time bucket below still changes the fingerprint.
+      // Keep the probe total-function; the next poll retries without reading
+      // the full student dataset.
     }
   }
   try {
@@ -546,6 +575,29 @@ export async function fetchStudentsFingerprint(): Promise<StudentsFingerprint> {
   if (!sb) parts.time_bucket = Math.floor(Date.now() / 60000)
   const fingerprint = Object.keys(parts).sort().map(k => `${k}=${parts[k]}`).join('|')
   return { fingerprint, counts, updated_at: new Date().toISOString() }
+}
+
+// Change probes are intentionally cached and coalesced. A dashboard tab polls
+// every 30 seconds, and multiple admin tabs/instances can otherwise fan that
+// one check into eight PostgREST requests each. A 15-second freshness window is
+// invisible to an operator but removes the burst load and keeps the probe from
+// becoming its own source of egress/connection pressure.
+const FINGERPRINT_TTL_MS = 15_000
+let fingerprintCache: { at: number; value: StudentsFingerprint } | null = null
+let fingerprintInFlight: Promise<StudentsFingerprint> | null = null
+
+export async function fetchStudentsFingerprint(): Promise<StudentsFingerprint> {
+  if (fingerprintCache && Date.now() - fingerprintCache.at < FINGERPRINT_TTL_MS) {
+    return fingerprintCache.value
+  }
+  if (fingerprintInFlight) return fingerprintInFlight
+  fingerprintInFlight = readStudentsFingerprint()
+    .then(value => {
+      fingerprintCache = { at: Date.now(), value }
+      return value
+    })
+    .finally(() => { fingerprintInFlight = null })
+  return fingerprintInFlight
 }
 
 // ---------------------------------------------------------------------------
@@ -646,7 +698,15 @@ async function queryRemoteWindow(
       narrowSelectOk = false
       continue
     }
-    throw Object.assign(new Error(String(error.message || 'Window query failed.')), { fallback: true })
+    // Only schema/setup failures should trigger the intentionally expensive
+    // full-table fallback. A timeout, connection reset, rate limit or RLS
+    // failure must NOT download every profile/result/resume just because one
+    // admin page refresh happened during a transient incident.
+    const message = String(error.message || 'Window query failed.')
+    const schemaFailure =
+      error?.code === '42P01' || error?.code === '42703' || error?.code === 'PGRST205' ||
+      /relation|table|view|schema cache|does not exist|unknown column/i.test(message)
+    throw Object.assign(new Error(message), { fallback: schemaFailure })
   }
   throw Object.assign(new Error('Window query failed.'), { fallback: true })
 }
@@ -743,10 +803,10 @@ async function pageFeedback(
     try {
       const queries: Promise<any>[] = []
       if (safeIds.length) {
-        queries.push(sb.from('feedback_submissions').select(FEEDBACK_COLUMNS).in('student_ref', safeIds))
+        queries.push(sb.from('feedback_submissions').select(FEEDBACK_COLUMNS).in('student_ref', safeIds).limit(100))
       }
       if (safeEmails.length) {
-        queries.push(sb.from('feedback_submissions').select(FEEDBACK_COLUMNS).in('email', safeEmails))
+        queries.push(sb.from('feedback_submissions').select(FEEDBACK_COLUMNS).in('email', safeEmails).limit(100))
       }
       const results = await Promise.all(queries)
       if (results.every(r => !r.error)) {
@@ -857,7 +917,13 @@ export async function fetchStudentsPage(params: AdminPageParams): Promise<Studen
   try {
     win = await queryRemoteWindow(sb, params, offset, limit)
   } catch (e: any) {
-    return fallbackPage(params, `Live paged query failed (${e?.message || e}); showing the full dataset from the fallback path instead.`)
+    if (e?.fallback) {
+      return fallbackPage(params, `Live paged query failed (${e?.message || e}); the paginated view is unavailable, so the setup fallback was used.`)
+    }
+    // Preserve the failure for the API layer. It can serve a short-lived stale
+    // page; silently switching to a multi-megabyte full read is exactly what
+    // caused the egress spikes during transient Supabase failures.
+    throw e
   }
   let remoteCount = win.count
   let total = remoteCount + L
@@ -868,7 +934,10 @@ export async function fetchStudentsPage(params: AdminPageParams): Promise<Studen
     try {
       win = await queryRemoteWindow(sb, params, offset, limit)
     } catch (e: any) {
-      return fallbackPage(params, `Live paged query failed (${e?.message || e}); showing the full dataset from the fallback path instead.`)
+      if (e?.fallback) {
+        return fallbackPage(params, `Live paged query failed (${e?.message || e}); the paginated view is unavailable, so the setup fallback was used.`)
+      }
+      throw e
     }
     remoteCount = win.count
     total = remoteCount + L

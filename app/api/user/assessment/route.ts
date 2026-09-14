@@ -30,13 +30,13 @@ export async function POST(req: Request) {
     const sb = getServerClient()
     let session = getAssessmentSession(originalId)
     if (!session && sb) {
-      const remote = originalId ? await fetchAssessmentSession(sb, toUuid(originalId) || originalId) : null
+      const remote = originalId ? await fetchAssessmentSession(sb, toUuid(originalId, 'session') || originalId) : null
       if (remote) session = remote as any
     }
     if (!session) {
       // Never lose a progress save: create a minimal row (server generates the uuid).
       session = {
-        id: toUuid(originalId) || randomUUID(),
+        id: toUuid(originalId, 'session') || randomUUID(),
         student_id: body.student_id || body.user_id || '',
         status: body.status || 'in_progress',
         started_at: body.started_at || new Date().toISOString(),
@@ -56,7 +56,13 @@ export async function POST(req: Request) {
     saveAssessmentSession(session)
     let supabase = false
     if (sb) supabase = await persistAssessmentSession(sb, session)
-    return NextResponse.json({ session, saved: true, supabase })
+    // Autosave requests already carry the latest answers from the browser. Do
+    // not echo that growing JSONB blob back on every checkpoint; the old echo
+    // multiplied answer payload bytes across all candidates and made the API
+    // unnecessarily chatty. A caller that needs answers uses GET explicitly.
+    const acknowledged = { ...session }
+    delete (acknowledged as any).answers
+    return NextResponse.json({ session: acknowledged, saved: true, supabase })
   } catch (e: any) {
     return NextResponse.json({ error: e.message || 'Failed to save assessment' }, { status: 500 })
   }
