@@ -15,8 +15,8 @@
 // counts + warning) so the dashboard can tell the admin *where* the data came
 // from and surface a clear reason when Supabase is configured but something is
 // off (e.g. the flattened export view has not been created yet). The Supabase
-// query always tries the view first and falls back to the base tables, and a
-// Supabase failure never hides the local rows.
+// query always tries the bounded view path; schema failures fail closed with a
+// warning, and a Supabase failure never hides the local rows.
 import { getAllFeedback, getDB } from './db.ts'
 import { getServerClient } from './supabaseServer.ts'
 import { fetchAllFeedback } from './persist.ts'
@@ -195,37 +195,42 @@ function fromViewRow(r: any, assessmentSession?: any): AdminStudentRow {
 }
 
 /**
- * Columns read from the `student_profiles_full` view. This is every view
- * column EXCEPT the two heavy JSONB blobs the admin never renders
- * (`resume_feedback` and `assessment_ai_feedback`) — skipping them shrinks
- * each row by ~20-40% and the dashboard downloads the whole table, so every
- * byte here is multiplied by the student count on each refresh.
+ * Columns read from the `student_profiles_full` view. This is only the
+ * identity, resume-summary and score fields buildRow actually needs; the two
+ * heavy JSONB blobs the admin never renders (`resume_feedback` and
+ * `assessment_ai_feedback`) plus storage/tenant metadata are excluded. The
+ * dashboard downloads a page repeatedly, so every unnecessary byte is
+ * multiplied by page size and refresh count.
  * (`feedback_rating/message/created_at` from migration 0004 are likewise
  * skipped — feedback is joined explicitly so the dashboard works whether or
  * not that migration has been applied.)
  */
 const VIEW_COLUMNS = [
+  // Only fields used by buildRow / the expanded row are selected. In
+  // particular, do not pull storage keys, avatar config, tenant metadata or
+  // the view's heavy AI-feedback JSONB column into every admin page.
   'student_id', 'email', 'role', 'full_name', 'prn', 'phone', 'dob', 'gender',
-  'degree', 'college', 'institution_id', 'graduation_year', 'cgpa', 'skills',
-  'linkedin_url', 'github_url', 'ai_avatar', 'profile_created_at',
-  'profile_updated_at', 'resume_id', 'resume_storage_key', 'resume_score',
-  'resume_parsed', 'resume_created_at', 'assessment_session_id', 'talent_score',
-  'grade', 'percentile', 'assessment_scores', 'verifiable_hash',
-  'report_storage_key', 'assessment_created_at',
+  'degree', 'college', 'graduation_year', 'cgpa', 'skills', 'linkedin_url',
+  'github_url', 'profile_created_at', 'resume_score', 'resume_parsed',
+  'assessment_session_id', 'talent_score', 'grade', 'percentile',
+  'assessment_scores', 'verifiable_hash', 'assessment_created_at',
 ].join(',')
 
-/**
- * Read the export view with the narrow column list above. Deployments whose
- * view predates a column (e.g. migration 0003's `prn` was never applied)
- * fail that query with an unknown-column error — retry those with a wildcard
- * so the dashboard keeps working instead of dropping to the heavier
- * base-table join.
- */
+// Migration 0003 added `prn`; migration 0002 already has every other field
+// needed by the table. Retry with this still-narrow projection rather than
+// `select=*`, which would pull the heavy feedback/AI JSONB columns for every
+// student when an older view is deployed.
+const LEGACY_VIEW_COLUMNS = VIEW_COLUMNS
+  .split(',')
+  .filter(column => column !== 'prn')
+  .join(',')
+
+/** Read the export view with a bounded projection in every schema generation. */
 async function fetchViewRows(sb: any): Promise<{ data?: any[] | null; error?: { message: string } | null }> {
   const narrow = await sb.from('student_profiles_full').select(VIEW_COLUMNS).eq('role', 'student')
   if (!narrow.error) return narrow
   if (/column|does not exist/i.test(String(narrow.error.message || ''))) {
-    return sb.from('student_profiles_full').select('*').eq('role', 'student')
+    return sb.from('student_profiles_full').select(LEGACY_VIEW_COLUMNS).eq('role', 'student')
   }
   return narrow
 }
@@ -249,67 +254,6 @@ async function latestAssessmentSessions(sb: any): Promise<Map<string, any>> {
     return latest
   } catch {
     return new Map()
-  }
-}
-
-/**
- * Fallback join against the base tables. Used when `student_profiles_full` does
- * not exist (e.g. only `supabase/schema.sql` was partially applied) so the
- * admin dashboard still shows real data instead of silently going empty.
- */
-async function fetchFromBaseTables(sb: any): Promise<{ rows: AdminStudentRow[]; error?: FetchError }> {
-  try {
-    const [profilesQ, resumesQ, resultsQ, sessionsQ] = await Promise.all([
-      sb.from('profiles').select('*').eq('role', 'student'),
-      // Narrow selects: the row builder only needs the score + parsed skills
-      // from resumes and the scores/total/grade/percentile/hash from results.
-      // `select('*')` would also drag the full `feedback` / `ai_feedback`
-      // JSONB blobs for every historic row (not just the latest per student).
-      sb.from('resume_analyses').select('student_id,resume_score,parsed,created_at').order('created_at', { ascending: false }),
-      sb.from('assessment_results').select('student_id,scores,total,grade,percentile,verifiable_hash,created_at').order('created_at', { ascending: false }),
-      sb.from('assessment_sessions')
-        .select('id,student_id,status,submitted_at,created_at')
-        .order('created_at', { ascending: false }),
-    ])
-    if (profilesQ.error) return { rows: [], error: { message: profilesQ.error.message } }
-    // Resumes / results are best-effort — keep profiles even if these fail.
-    const resumes: any[] = resumesQ.data || []
-    const results: any[] = resultsQ.data || []
-    const sessions: any[] = sessionsQ.data || []
-    const byStudent = (arr: any[]) => {
-      const map = new Map<string, any>()
-      for (const row of arr) {
-        const key = String(row.student_id || '')
-        if (!key) continue
-        // Prefer the first (already newest-first) row on a per-student basis.
-        if (!map.has(key)) map.set(key, row)
-      }
-      return map
-    }
-    const latestResume = byStudent(resumes)
-    const latestResult = byStudent(results)
-    const latestSession = byStudent(sessions.filter(sessionCountsAsAssessment))
-
-    const rows = (profilesQ.data || []).map((p: any) => {
-      const result = latestResult.get(p.id)
-      const session = latestSession.get(p.id)
-      return buildRow({
-        student_id: p.id,
-        email: p.email,
-        role: p.role,
-        profile: p,
-        scores: result || null,
-        resume_score: latestResume.get(p.id)?.resume_score,
-        resume_parsed: latestResume.get(p.id)?.parsed,
-        assessment_attempted: sessionCountsAsAssessment(session),
-        verifiable_hash: result?.verifiable_hash,
-        assessed_at: result?.created_at || session?.submitted_at || session?.created_at,
-        created_at: p.created_at,
-      })
-    })
-    return { rows: sortRows(rows) }
-  } catch (e: any) {
-    return { rows: [], error: { message: e?.message || 'Base-table fallback failed.' } }
   }
 }
 
@@ -398,15 +342,12 @@ export async function fetchAllStudents(): Promise<AdminStudentsResult> {
             'No live students were returned. The admin is reading Supabase with the anon key, which is restricted by Row Level Security. Set SUPABASE_SERVICE_ROLE_KEY so the admin can read every student record.'
         }
       } else {
-        // 2) The view is missing / errored — fall back to the base tables.
-        const viewWarning = `student_profiles_full view: ${error.message}`
-        const fallback = await fetchFromBaseTables(sb)
-        if (!fallback.error) {
-          remote = fallback.rows
-          warning = `${viewWarning}. Showing results joined from the base tables instead.`
-        } else {
-          warning = `Could not load students from Supabase: ${fallback.error.message}`
-        }
+        // 2) Fail closed for a missing/broken view. Reading every base-table
+        // row here would make a deployment/schema mistake take down the
+        // database through egress. Local demo rows remain visible and the
+        // warning points directly to the required migration.
+        warning =
+          `Could not load the Supabase student view: ${error.message}. Apply the Supabase migrations before using live admin data.`
       }
     } catch (e: any) {
       warning = `Could not load students from Supabase: ${e?.message || e}`
@@ -469,30 +410,6 @@ export interface StudentsFingerprint {
   updated_at: string
 }
 
-/** Row count via a HEAD-style query — transfers bytes, not rows. */
-async function tableCount(sb: any, table: string, roleFilter = false): Promise<number> {
-  try {
-    let q = sb.from(table).select('id', { count: 'exact', head: true })
-    if (roleFilter) q = q.eq('role', 'student')
-    const { count, error } = await q
-    if (error) return -1
-    return count ?? 0
-  } catch {
-    return -1
-  }
-}
-
-/** Newest timestamp in a table (single tiny row) — catches edits that keep counts equal. */
-async function latestStamp(sb: any, table: string, col: string): Promise<string> {
-  try {
-    const { data, error } = await sb.from(table).select(col).order(col, { ascending: false }).limit(1).maybeSingle()
-    if (error || !data) return ''
-    return String((data as any)[col] || '')
-  } catch {
-    return ''
-  }
-}
-
 /**
  * A ~1KB summary of everything the dashboard renders, used by
  * `GET /api/admin/students?check=1`. The admin page polls this on its refresh
@@ -502,36 +419,46 @@ async function latestStamp(sb: any, table: string, col: string): Promise<string>
  * too (free — no Supabase traffic) so seeded/demo edits are also detected.
  * Never throws: degrades to a time-based fingerprint when Supabase is down.
  */
-export async function fetchStudentsFingerprint(): Promise<StudentsFingerprint> {
+async function readStudentsFingerprint(): Promise<StudentsFingerprint> {
   const sb = getServerClient()
   const parts: Record<string, string | number> = { remote: sb ? 1 : 0 }
   const counts = { profiles: -1, results: -1, resumes: -1, feedback: -1 }
   if (sb) {
     try {
-      const [profiles, results, resumes, feedback, pStamp, rStamp, resStamp, fStamp] = await Promise.all([
-        tableCount(sb, 'profiles', true),
-        tableCount(sb, 'assessment_results'),
-        tableCount(sb, 'resume_analyses'),
-        tableCount(sb, 'feedback_submissions'),
-        latestStamp(sb, 'profiles', 'updated_at'),
-        latestStamp(sb, 'assessment_results', 'created_at'),
-        latestStamp(sb, 'resume_analyses', 'created_at'),
-        latestStamp(sb, 'feedback_submissions', 'created_at'),
-      ])
-      counts.profiles = profiles
-      counts.results = results
-      counts.resumes = resumes
-      counts.feedback = feedback
-      parts.profiles = profiles
-      parts.results = results
-      parts.resumes = resumes
-      parts.feedback = feedback
-      parts.pStamp = pStamp
-      parts.rStamp = rStamp
-      parts.resStamp = resStamp
-      parts.fStamp = fStamp
+      // Migration 0007 collapses the old eight count/MAX requests into one
+      // tiny row. If it is missing, fail closed: do not resurrect the old
+      // eight-query fallback on every poll. The table page remains available
+      // and a manual refresh still works; auto-refresh resumes as soon as the
+      // migration is applied and the probe becomes visible.
+      const compact = await sb.from('admin_change_probe').select('*').limit(1).maybeSingle()
+      if (!compact.error && compact.data) {
+        const d: any = compact.data
+        const profiles = Number(d.profiles_count) || 0
+        const results = Number(d.results_count) || 0
+        const resumes = Number(d.resumes_count) || 0
+        const feedback = Number(d.feedback_count) || 0
+        counts.profiles = profiles
+        counts.results = results
+        counts.resumes = resumes
+        counts.feedback = feedback
+        parts.profiles = profiles
+        parts.results = results
+        parts.resumes = resumes
+        parts.feedback = feedback
+        parts.pStamp = String(d.profiles_stamp || '')
+        parts.rStamp = String(d.results_stamp || '')
+        parts.resStamp = String(d.resumes_stamp || '')
+        parts.fStamp = String(d.feedback_stamp || '')
+        parts.sStamp = String(d.sessions_stamp || '')
+        parts.sessions = Number(d.sessions_count) || 0
+      } else {
+        // Keep this fingerprint stable. A time bucket would cause the client
+        // to download another full page every minute while the compact probe is
+        // unavailable, which is exactly the egress failure this guard prevents.
+        parts.remote_probe = 'unavailable'
+      }
     } catch {
-      // Fall through — the time bucket below still changes the fingerprint.
+      parts.remote_probe = 'unavailable'
     }
   }
   try {
@@ -543,9 +470,31 @@ export async function fetchStudentsFingerprint(): Promise<StudentsFingerprint> {
   } catch {
     // Local store unreadable — ignore, remote parts still identify changes.
   }
-  if (!sb) parts.time_bucket = Math.floor(Date.now() / 60000)
   const fingerprint = Object.keys(parts).sort().map(k => `${k}=${parts[k]}`).join('|')
   return { fingerprint, counts, updated_at: new Date().toISOString() }
+}
+
+// Change probes are intentionally cached and coalesced. A dashboard tab polls
+// every 30 seconds, and multiple admin tabs/instances can otherwise fan that
+// one check into eight PostgREST requests each. A 15-second freshness window is
+// invisible to an operator but removes the burst load and keeps the probe from
+// becoming its own source of egress/connection pressure.
+const FINGERPRINT_TTL_MS = 15_000
+let fingerprintCache: { at: number; value: StudentsFingerprint } | null = null
+let fingerprintInFlight: Promise<StudentsFingerprint> | null = null
+
+export async function fetchStudentsFingerprint(): Promise<StudentsFingerprint> {
+  if (fingerprintCache && Date.now() - fingerprintCache.at < FINGERPRINT_TTL_MS) {
+    return fingerprintCache.value
+  }
+  if (fingerprintInFlight) return fingerprintInFlight
+  fingerprintInFlight = readStudentsFingerprint()
+    .then(value => {
+      fingerprintCache = { at: Date.now(), value }
+      return value
+    })
+    .finally(() => { fingerprintInFlight = null })
+  return fingerprintInFlight
 }
 
 // ---------------------------------------------------------------------------
@@ -611,7 +560,7 @@ async function queryRemoteWindow(
   for (let attempt = 0; attempt < 4; attempt++) {
     let q = sb
       .from('student_profiles_full')
-      .select(wide ? '*' : VIEW_COLUMNS, { count: 'exact' })
+      .select(wide ? LEGACY_VIEW_COLUMNS : VIEW_COLUMNS, { count: 'exact' })
       .eq('role', 'student')
     if (params.college) q = q.ilike('college', params.college)
     if (params.q) {
@@ -646,7 +595,15 @@ async function queryRemoteWindow(
       narrowSelectOk = false
       continue
     }
-    throw Object.assign(new Error(String(error.message || 'Window query failed.')), { fallback: true })
+    // Only schema/setup failures should trigger the intentionally expensive
+    // full-table fallback. A timeout, connection reset, rate limit or RLS
+    // failure must NOT download every profile/result/resume just because one
+    // admin page refresh happened during a transient incident.
+    const message = String(error.message || 'Window query failed.')
+    const schemaFailure =
+      error?.code === '42P01' || error?.code === '42703' || error?.code === 'PGRST205' ||
+      /relation|table|view|schema cache|does not exist|unknown column/i.test(message)
+    throw Object.assign(new Error(message), { fallback: schemaFailure })
   }
   throw Object.assign(new Error('Window query failed.'), { fallback: true })
 }
@@ -743,10 +700,10 @@ async function pageFeedback(
     try {
       const queries: Promise<any>[] = []
       if (safeIds.length) {
-        queries.push(sb.from('feedback_submissions').select(FEEDBACK_COLUMNS).in('student_ref', safeIds))
+        queries.push(sb.from('feedback_submissions').select(FEEDBACK_COLUMNS).in('student_ref', safeIds).limit(100))
       }
       if (safeEmails.length) {
-        queries.push(sb.from('feedback_submissions').select(FEEDBACK_COLUMNS).in('email', safeEmails))
+        queries.push(sb.from('feedback_submissions').select(FEEDBACK_COLUMNS).in('email', safeEmails).limit(100))
       }
       const results = await Promise.all(queries)
       if (results.every(r => !r.error)) {
@@ -794,9 +751,9 @@ async function fallbackPage(
  * Remote bytes per page are O(pageSize + localCount): one SQL window with an
  * exact count, one sessions lookup and two feedback lookups for the page's
  * ids, plus two tiny de-dup probes — instead of the full multi-MB table.
- * Never throws: degrades to the in-memory fallback (with a warning) when the
- * view is missing or a query fails, and to local-only rows when Supabase is
- * down, so a Supabase problem never blanks the dashboard.
+ * Never throws: schema failures degrade to bounded/local rows with a warning,
+ * while transient Supabase failures are allowed to reach the API's stale-page
+ * guard rather than triggering a full-table read.
  */
 export async function fetchStudentsPage(params: AdminPageParams): Promise<StudentsPageResult> {
   const sb = getServerClient()
@@ -857,7 +814,13 @@ export async function fetchStudentsPage(params: AdminPageParams): Promise<Studen
   try {
     win = await queryRemoteWindow(sb, params, offset, limit)
   } catch (e: any) {
-    return fallbackPage(params, `Live paged query failed (${e?.message || e}); showing the full dataset from the fallback path instead.`)
+    if (e?.fallback) {
+      return fallbackPage(params, `Live paged query failed (${e?.message || e}); the paginated view is unavailable, so the setup fallback was used.`)
+    }
+    // Preserve the failure for the API layer. It can serve a short-lived stale
+    // page; silently switching to a multi-megabyte full read is exactly what
+    // caused the egress spikes during transient Supabase failures.
+    throw e
   }
   let remoteCount = win.count
   let total = remoteCount + L
@@ -868,7 +831,10 @@ export async function fetchStudentsPage(params: AdminPageParams): Promise<Studen
     try {
       win = await queryRemoteWindow(sb, params, offset, limit)
     } catch (e: any) {
-      return fallbackPage(params, `Live paged query failed (${e?.message || e}); showing the full dataset from the fallback path instead.`)
+      if (e?.fallback) {
+        return fallbackPage(params, `Live paged query failed (${e?.message || e}); the paginated view is unavailable, so the setup fallback was used.`)
+      }
+      throw e
     }
     remoteCount = win.count
     total = remoteCount + L
@@ -925,7 +891,7 @@ export async function fetchStudentsPage(params: AdminPageParams): Promise<Studen
 
 // ---------------------------------------------------------------------------
 // Dashboard meta: college list + global stats in ~1KB (migration 0006's
-// single-row `admin_stats` view), with narrow-scan fallbacks for older DBs.
+// single-row `admin_stats` view), with a bounded legacy scan for older DBs.
 // ---------------------------------------------------------------------------
 
 export interface AdminMetaStats {
@@ -969,14 +935,17 @@ async function fetchRemoteMeta(sb: any): Promise<RemoteMeta> {
   } catch {
     // View missing (pre-0006) — fall through to the narrow scan.
   }
-  // 2) Narrow scan of the export view. `assessed` here means "has a result"
-  //    (attempts with a missing result are not visible without 0006) —
-  //    consistent with the unmigrated table filter.
+  // 2) Bounded legacy fallback. Do not scan the export view or all base-table
+  // rows when migration 0006 is absent: that was the second source of large
+  // admin reads in the incident logs. This sample is capped and is only a
+  // temporary degraded view until `admin_stats` is deployed. The table page
+  // remains the source for actual student rows, while the cards may be partial.
   try {
-    const { data, error } = await sb
+    const { data, count, error } = await sb
       .from('student_profiles_full')
-      .select('talent_score,college')
+      .select('talent_score,college', { count: 'exact' })
       .eq('role', 'student')
+      .range(0, 99)
     if (!error && data) {
       let assessed = 0
       let scoreSum = 0
@@ -989,40 +958,20 @@ async function fetchRemoteMeta(sb: any): Promise<RemoteMeta> {
         const c = String(r.college || '').trim()
         if (c) colleges.add(c)
       }
-      return { total: data.length, assessed, scored: assessed, scoreSum, colleges: [...colleges] }
+      return {
+        // PostgREST's exact count remains cheap; assessed/average are based on
+        // the bounded sample and are replaced by exact values after migration.
+        total: count ?? data.length,
+        assessed,
+        scored: assessed,
+        scoreSum,
+        colleges: [...colleges],
+      }
     }
   } catch {
-    // View missing entirely — fall through to the base tables.
+    // View missing entirely — no unbounded base-table fallback.
   }
-  // 3) Base tables (setup-error states only).
-  try {
-    const [pq, rq] = await Promise.all([
-      sb.from('profiles').select('id,college').eq('role', 'student'),
-      sb.from('assessment_results').select('student_id,total,created_at').order('created_at', { ascending: false }),
-    ])
-    if (pq.error) return EMPTY_META
-    const latest = new Map<string, number>()
-    for (const r of rq.data || []) {
-      const id = String(r.student_id || '')
-      if (id && !latest.has(id)) latest.set(id, Number(r.total) || 0)
-    }
-    let scoreSum = 0
-    for (const t of latest.values()) scoreSum += t
-    const colleges = new Set<string>()
-    for (const p of pq.data || []) {
-      const c = String(p.college || '').trim()
-      if (c) colleges.add(c)
-    }
-    return {
-      total: (pq.data || []).length,
-      assessed: latest.size,
-      scored: latest.size,
-      scoreSum,
-      colleges: [...colleges],
-    }
-  } catch {
-    return EMPTY_META
-  }
+  return EMPTY_META
 }
 
 /**

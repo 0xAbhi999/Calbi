@@ -51,7 +51,13 @@ function Inner(){
       setValidated(true)
     })()
     return () => { cancelled = true }
-  },[hydrated, user, router, setUser, reconcileForUser])
+  // Only the account id controls this auth check. The store exposes setter
+  // functions through context; depending on their render-time identities made
+  // this effect run again after every profile/score update and created a
+  // request storm (hundreds of /profiles and /assessment_results reads per
+  // minute for one student).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[hydrated, user?.id])
 
   // The assessment page hands the candidate here after submitting and leaves a
   // single-use ticket behind, so this is where "assessment complete" is
@@ -103,7 +109,11 @@ function Inner(){
       // screen or in the downloaded PDF.
       setScores(flattenAssessmentResult(data.result))
     }).catch(()=>{})
-  },[user?.id, validated, setProfile, setResume, setScores])
+  // The setters are intentionally omitted: they are context wrappers whose
+  // identity changes when the store updates. Including them recreates `refresh`,
+  // which re-runs the forced refresh effect and loops back into Supabase.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[user?.id, validated])
 
   useEffect(()=>{
     refresh(true)

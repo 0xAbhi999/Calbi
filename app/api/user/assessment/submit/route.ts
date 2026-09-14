@@ -10,7 +10,7 @@ export async function POST(req: Request) {
     // Local demo ids ("sess_xyz") are not valid Postgres uuids — map them so
     // the result row actually lands in Supabase (the row-level mirror silently
     // failed before, so returners looked like they never took the assessment).
-    const sessionId = toUuid(body.session_id) || randomUUID()
+    const sessionId = toUuid(body.session_id, 'session') || randomUUID()
     // A hydrated client normally sends the user id. If the final submit races
     // the client store hydration, recover it from the already-saved session
     // instead of writing the result under "unknown" / a random UUID. That
@@ -22,7 +22,7 @@ export async function POST(req: Request) {
       ? suppliedStudentId
       : String(s?.student_id || '').trim()
     const result = {
-      id: toUuid(body.id) || 'res_' + Math.random().toString(16).slice(2, 10),
+      id: toUuid(body.id, 'result') || 'res_' + Math.random().toString(16).slice(2, 10),
       session_id: sessionId,
       student_id: studentId,
       scores: body.scores || {},

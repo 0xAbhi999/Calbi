@@ -306,8 +306,13 @@ function AssessmentInner() {
   // Timer that re-arms the proctoring monitors once a native fullscreen
   // permission prompt has been answered (see `enterFullscreen` below).
   const fsSuppressTimerRef = useRef<any>(null)
-  // Debounced server autosave (see the `[answers, sid]` effect below).
+  // Throttled server autosave (see the `[answers, sid]` effect below). The
+  // browser keeps every keystroke in localStorage; Postgres only receives a
+  // checkpoint at most once per 10 seconds. The final submit always sends the
+  // complete answer set, so this is a durability checkpoint rather than a
+  // source of truth.
   const autosaveTimerRef = useRef<any>(null)
+  const autosaveLastSentRef = useRef(0)
   const strikesRef = useRef(0)
   // Timestamp of the last recorded strike — used to coalesce the burst of
   // blur/visibility/fullscreen events a single action produces.
@@ -406,21 +411,22 @@ function AssessmentInner() {
   useEffect(() => {
     if (sid) {
       localStorage.setItem('calibiai_answers_' + sid, JSON.stringify(answers))
-      // Server autosave is debounced: typing a sentence would otherwise fire
-      // dozens of POSTs (one per keystroke), and at 5000 concurrent candidates
-      // that is a needless write storm on the store. One save ~1.5s after the
-      // user stops typing is plenty — the final submit persists everything.
+      // Server autosave is debounced AND throttled: typing a sentence would
+      // otherwise fire a write after every pause. LocalStorage is the fast,
+      // per-keystroke recovery layer; Postgres is a checkpoint no more often
+      // than once per 10 seconds. The final submit persists the latest state.
       if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current)
+      const minInterval = 10_000
+      const wait = Math.max(1_500, minInterval - (Date.now() - autosaveLastSentRef.current))
       autosaveTimerRef.current = setTimeout(() => {
         autosaveTimerRef.current = null
-        try {
-          fetch('/api/user/assessment', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: sid, student_id: user?.id || '', answers, status: 'in_progress' }),
-          })
-        } catch { /* demo mode */ }
-      }, 1500)
+        autosaveLastSentRef.current = Date.now()
+        fetch('/api/user/assessment', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sid, student_id: user?.id || '', answers, status: 'in_progress' }),
+        }).catch(() => { /* localStorage remains the recovery layer */ })
+      }, wait)
     }
   }, [answers, sid, user?.id])
   useEffect(() => { if (sid) localStorage.setItem('calibiai_ai_' + sid, JSON.stringify(aiResults)) }, [aiResults, sid])
@@ -967,7 +973,12 @@ function AssessmentInner() {
     const payload = { session_id: sid || 'sess_demo', ...scores, tab_switches: strikes, auto_submitted: !!auto, submitted_at: new Date().toISOString() }
     localStorage.setItem('calibiai_scores', JSON.stringify(payload))
     setScores(payload)
-    const sb = getSupabase()
+    // The server API is the single persistence boundary. The previous client
+    // implementation also called Supabase directly after these two API calls,
+    // which duplicated every final session/result write and bypassed the
+    // server's deterministic id mapping and retry/error handling. Apart from
+    // doubling database work, that race could leave the session and result out
+    // of sync. Keep browser code transport-only; the API owns Postgres writes.
     try {
       await fetch('/api/user/assessment', {
         method: 'POST',
@@ -980,18 +991,6 @@ function AssessmentInner() {
         body: JSON.stringify({ session_id: sid, student_id: user?.id || 'unknown', scores: payload, total: payload.total, grade: payload.grade, percentile: payload.percentile, verifiable_hash: payload.verifiable_hash, ai_feedback: aiResults }),
       })
     } catch (e) { /* demo mode */ }
-    if (sb && sid) {
-      try {
-        const { data: { user: authUser } } = await sb.auth.getUser()
-        if (authUser) {
-          await sb.from('assessment_sessions').update({ answers, status: auto ? 'expired' : 'submitted', submitted_at: new Date().toISOString(), tab_switches: strikes }).eq('id', sid)
-          await sb.from('assessment_results').upsert(
-            { session_id: sid, student_id: authUser.id, scores: payload, total: payload.total, grade: payload.grade, percentile: payload.percentile, verifiable_hash: payload.verifiable_hash, ai_feedback: aiResults },
-            { onConflict: 'session_id' },
-          )
-        }
-      } catch (e) { /* demo mode */ }
-    }
     const s = JSON.parse(localStorage.getItem('calibiai_session') || '{}')
     s.status = 'submitted'
     localStorage.setItem('calibiai_session', JSON.stringify(s))

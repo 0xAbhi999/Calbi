@@ -24,6 +24,19 @@ export interface AuthResult {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
+// Explicit projections keep the dashboard/auth reconciliation path bounded even
+// when a profile or assessment row gains a large JSON/text column later.
+export const PROFILE_SELECT = [
+  'id', 'email', 'role', 'full_name', 'prn', 'phone', 'dob', 'gender', 'degree',
+  'college', 'institution_id', 'graduation_year', 'cgpa', 'skills',
+  'linkedin_url', 'github_url', 'ai_avatar', 'created_at', 'updated_at',
+].join(',')
+
+export const ASSESSMENT_RESULT_SELECT = [
+  'id', 'session_id', 'student_id', 'scores', 'total', 'grade', 'percentile',
+  'verifiable_hash', 'ai_feedback', 'report_storage_key', 'created_at',
+].join(',')
+
 function clean(v: any): string | null {
   const s = String(v ?? '').trim()
   return s ? s : null
@@ -31,18 +44,21 @@ function clean(v: any): string | null {
 
 /**
  * Postgres `uuid` columns reject the short local-demo ids the client used to
- * send ("sess_abc123"), which made every assessment row mirror fail silently
- * ("invalid input syntax for type uuid") — so results never reached Supabase
- * and returning students were treated as first-timers.
- * Map any invalid id to a fresh uuid so Supabase writes always succeed; API
- * routes use the same value for the local JSON store so the two stay in sync.
- * A malformed user id is also rejected (FK constraint) by returning null.
+ * send ("sess_abc123"). The old fallback called `randomUUID()` here, which
+ * meant every autosave created a different session id and could expire the
+ * previous active row on every request. That is both a correctness bug and a
+ * very expensive write storm.
+ *
+ * Keep real UUIDs unchanged and map local ids deterministically. The scope is
+ * part of the namespace so profile, session and result ids cannot collide and
+ * retries always address the same Postgres row. `mapId` uses the same stable
+ * UUID scheme as the admin seed job.
  */
-export function toUuid(value: any): string | null {
+export function toUuid(value: any, scope = 'profile'): string | null {
   const s = String(value ?? '').trim()
   if (!s) return null
   if (UUID_RE.test(s)) return s
-  return randomUUID()
+  return mapId(scope, s)
 }
 
 /** Email + password live in Supabase Auth (auth.users); metadata seeds the profile row. */
@@ -145,7 +161,7 @@ export async function fetchProfile(client: SupabaseClient, userId: string): Prom
   try {
     const { data } = await client
       .from('profiles')
-      .select('*')
+      .select(PROFILE_SELECT)
       .eq('id', userId)
       .maybeSingle()
     return data || null
@@ -355,12 +371,18 @@ export async function fetchAllHelpRequests(client: SupabaseClient): Promise<any[
 }
 
 /** Every feedback row (admin dashboard) — null when the table is not there yet. */
-export async function fetchAllFeedback(client: SupabaseClient): Promise<any[] | null> {
+const FEEDBACK_SELECT = 'id,student_id,student_ref,email,session_id,rating,message,source,created_at'
+
+export async function fetchAllFeedback(client: SupabaseClient, limit = 500): Promise<any[] | null> {
   try {
     const { data, error } = await client
       .from('feedback_submissions')
-      .select('*')
+      .select(FEEDBACK_SELECT)
       .order('created_at', { ascending: false })
+      // Feedback is user-entered and unbounded. Never let an admin refresh or
+      // candidate lookup transfer the entire history without a hard ceiling;
+      // explicit exports can be implemented as a separate paginated job.
+      .limit(Math.max(1, Math.min(500, limit)))
     if (error) {
       console.warn('[supabase] feedback read failed:', error.message)
       return null
@@ -368,6 +390,37 @@ export async function fetchAllFeedback(client: SupabaseClient): Promise<any[] | 
     return data || []
   } catch (e: any) {
     console.warn('[supabase] feedback read failed:', e?.message || e)
+    return null
+  }
+}
+
+/** Candidate-scoped feedback lookup. Never fetch the global feedback table for
+ * a single student: the old endpoint downloaded up to the entire history and
+ * filtered it in Node, making egress grow with every candidate's request. */
+export async function fetchFeedbackForStudent(
+  client: SupabaseClient,
+  studentId: string,
+  email: string,
+): Promise<any[] | null> {
+  try {
+    const queries: Promise<any>[] = []
+    if (studentId.trim()) {
+      queries.push(client.from('feedback_submissions').select(FEEDBACK_SELECT).eq('student_ref', studentId.trim()).order('created_at', { ascending: false }).limit(100))
+    }
+    if (email.trim()) {
+      queries.push(client.from('feedback_submissions').select(FEEDBACK_SELECT).eq('email', email.trim().toLowerCase()).order('created_at', { ascending: false }).limit(100))
+    }
+    if (!queries.length) return []
+    const results = await Promise.all(queries)
+    if (results.some(r => r.error)) return null
+    const seen = new Set<string>()
+    return results.flatMap(r => r.data || []).filter((row: any) => {
+      const key = String(row.id || `${row.created_at}|${row.message}`)
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    }).sort((a: any, b: any) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime())
+  } catch {
     return null
   }
 }
@@ -416,13 +469,13 @@ export async function expireActiveAssessmentSessions(
  * any older active session before retrying.
  */
 export async function persistAssessmentSession(client: SupabaseClient, s: any): Promise<boolean> {
-  const studentId = toUuid(s.student_id)
+  const studentId = toUuid(s.student_id, 'profile')
   if (!studentId) {
     console.warn('[supabase] session persist skipped: invalid student_id')
     return false
   }
   const row = {
-    id: toUuid(s.id) || randomUUID(),
+    id: toUuid(s.id, 'session') || randomUUID(),
     student_id: studentId,
     started_at: s.started_at ? new Date(s.started_at).toISOString() : new Date().toISOString(),
     expires_at: s.expires_at ? new Date(s.expires_at).toISOString() : new Date(Date.now() + 7200 * 1000).toISOString(),
@@ -448,8 +501,8 @@ export async function persistAssessmentSession(client: SupabaseClient, s: any): 
 
 /** Mirrors the final evaluation result (scores) into public.assessment_results. */
 export async function persistAssessmentResult(client: SupabaseClient, r: any): Promise<boolean> {
-  const studentId = toUuid(r.student_id)
-  const sessionId = toUuid(r.session_id)
+  const studentId = toUuid(r.student_id, 'profile')
+  const sessionId = toUuid(r.session_id, 'session')
   if (!studentId || !sessionId) {
     console.warn('[supabase] result persist skipped: invalid student_id/session_id')
     return false
@@ -511,7 +564,7 @@ export async function fetchLatestAssessmentResult(client: SupabaseClient, studen
   try {
     const { data } = await client
       .from('assessment_results')
-      .select('*')
+      .select(ASSESSMENT_RESULT_SELECT)
       .eq('student_id', studentId)
       .order('created_at', { ascending: false })
       .limit(1)

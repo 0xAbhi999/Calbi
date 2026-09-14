@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { findProfileByPrn, getProfileById, saveProfile } from '@/lib/db'
 import { getServerClient } from '@/lib/supabaseServer'
-import { persistProfile, fetchProfile } from '@/lib/persist'
+import { persistProfile, fetchProfile, PROFILE_SELECT } from '@/lib/persist'
 import {
   GENDER_OPTIONS,
   PHONE_DIGITS,
@@ -53,7 +53,7 @@ export async function GET(req: Request) {
     if (!userId) return NextResponse.json({ error: 'Missing user_id' }, { status: 400 })
     const sb = getServerClient()
     if (sb) {
-      const { data } = await sb.from('profiles').select('*').eq('id', userId).maybeSingle()
+      const { data } = await sb.from('profiles').select(PROFILE_SELECT).eq('id', userId).maybeSingle()
       if (data) return NextResponse.json({ profile: data, supabase: true })
     }
     const profile = getProfileById(userId)
