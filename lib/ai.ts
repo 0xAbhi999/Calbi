@@ -8,6 +8,8 @@
 // guard clauses below run BEFORE the model so a blank answer can never be
 // inflated by a lenient LLM.
 
+import { fetchWithTimeout } from './fetchTimeout.ts'
+
 export type AiKind = 'writing' | 'speaking' | 'debugging' | 'feature' | 'prompt'
 
 export interface AiEval {
@@ -22,6 +24,11 @@ export interface AiEval {
 const AI_KEY = process.env.CALIBIAI_API_KEY || process.env.DEEPSEEK_API_KEY || ''
 const AI_BASE = process.env.CALIBIAI_BASE_URL || process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'
 const AI_MODEL = process.env.CALIBIAI_MODEL || process.env.DEEPSEEK_MODEL || 'deepseek-chat'
+
+// Hard ceiling on the upstream grader. A hung model must degrade to the local
+// heuristic engine (callCalibiAi catches the abort and returns null) instead
+// of holding the request handler open under load.
+const AI_TIMEOUT_MS = 15000
 
 // Prompt submissions must contain at least this many characters to earn any
 // credit. Shorter answers are treated as empty and score 0 (with a clear note).
@@ -57,7 +64,7 @@ function zero(improvements: string[], summary: string): AiEval {
 async function callCalibiAi(systemPrompt: string, userPrompt: string): Promise<any | null> {
   if (!AI_KEY) return null
   try {
-    const res = await fetch(`${AI_BASE}/chat/completions`, {
+    const res = await fetchWithTimeout(`${AI_BASE}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AI_KEY}` },
       body: JSON.stringify({
@@ -69,7 +76,7 @@ async function callCalibiAi(systemPrompt: string, userPrompt: string): Promise<a
           { role: 'user', content: userPrompt },
         ],
       }),
-    })
+    }, AI_TIMEOUT_MS)
     if (!res.ok) {
       console.error('CalibiAI grader error', res.status, await res.text().catch(() => ''))
       return null

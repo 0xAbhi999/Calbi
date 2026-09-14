@@ -33,7 +33,8 @@ test('verifySessionToken rejects tampered, garbage and expired tokens', () => {
 
 test('safeEqual is true only for identical strings', () => {
   assert.equal(safeEqual(ADMIN_USERNAME, 'admin'), true)
-  assert.equal(safeEqual(ADMIN_PASSWORD, 'Admin@123'), true)
+  assert.equal(safeEqual(ADMIN_PASSWORD, 'CalibiAdmin@777'), true)
+  assert.equal(safeEqual(ADMIN_PASSWORD, 'Admin@123'), false)
   assert.equal(safeEqual(ADMIN_PASSWORD, 'admin'), false)
 })
 

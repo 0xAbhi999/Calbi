@@ -1,6 +1,7 @@
 'use client'
 export const dynamic = 'force-dynamic'
 import { useEffect, useRef, useState } from 'react'
+import { FeedbackGate } from '@/components/FeedbackGate'
 import { useRouter } from 'next/navigation'
 import { ScoreReport } from '@/components/ScoreReport'
 import { AFTER_ASSESSMENT_ROUTE } from '@/lib/nextStep'
@@ -40,5 +41,5 @@ function ResultInner() {
 }
 
 export default function Page() {
-  return <ResultInner />
+  return <FeedbackGate><ResultInner /></FeedbackGate>
 }

@@ -12,8 +12,24 @@ import {
   evaluateWriting, evaluateSpeaking, evaluateDebugging, evaluateFeature, evaluatePrompt,
   isCalibiAiConfigured, type AiKind,
 } from '@/lib/ai'
+import { checkRateLimit, getClientIp } from '@/lib/rateLimit'
+
+// Per-IP *abuse backstop* only (campuses share one NAT IP, so this must stay
+// generous — it is not a per-student throttle). Each call may hit an upstream
+// LLM, so the concurrency of upstream calls is the thing to watch; this just
+// stops a single scripted source from flooding the grader.
+const RATE_LIMIT = 2000
+const RATE_WINDOW_MS = 60_000
 
 export async function POST(req: Request) {
+  const rl = checkRateLimit(`evaluate:${getClientIp(req)}`, RATE_LIMIT, RATE_WINDOW_MS)
+  if (!rl.allowed) {
+    return NextResponse.json(
+      { error: 'Too many evaluations — slow down.' },
+      { status: 429, headers: { 'Retry-After': String(rl.retryAfterSec) } },
+    )
+  }
+
   let body: any
   try {
     body = await req.json()

@@ -4,13 +4,13 @@
 // in demo mode and in production, on any domain.
 //
 // Credentials are fixed by the product owner: username `admin`, password
-// `Admin@123`. The cookie token expires after ADMIN_SESSION_HOURS and is
+// `CalibiAdmin@777`. The cookie token expires after ADMIN_SESSION_HOURS and is
 // re-verified on every /api/admin/* request — there is no client-side "trust
 // me" flag, so the data API stays closed to anyone who did not log in.
 import { createHmac, timingSafeEqual } from 'crypto'
 
 export const ADMIN_USERNAME = 'admin'
-export const ADMIN_PASSWORD = 'Admin@123'
+export const ADMIN_PASSWORD = 'CalibiAdmin@777'
 export const ADMIN_COOKIE = 'calibiai_admin_session'
 const ADMIN_SESSION_HOURS = 8
 /** Override in production via env ADMIN_SECRET (any long random string). */

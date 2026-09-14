@@ -7,8 +7,13 @@
     "dev": "next dev -p 3000 -H 0.0.0.0",
     "build": "next build",
     "start": "next start -p 3000 -H 0.0.0.0",
+    "start:cluster": "pm2 startOrReload ecosystem.config.cjs",
     "lint": "next lint",
-    "test": "node --experimental-strip-types --test \"lib/__tests__/**/*.test.ts\""
+    "test": "node --experimental-strip-types --test \"lib/__tests__/**/*.test.ts\"",
+    "loadtest": "node scripts/loadtest.js",
+    "loadtest:k6": "k6 run scripts/loadtest.k6.js",
+    "seed:supabase": "node --experimental-strip-types scripts/seed-supabase.ts",
+    "verify:sql": "node scripts/verify-student-report.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.115.0",
@@ -22,8 +27,10 @@
     "recharts": "^2.12.7"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
     "@types/node": "20.12.12",
     "@types/react": "18.3.3",
+    "@types/react-dom": "^18.3.7",
     "autoprefixer": "10.4.19",
     "postcss": "8.4.38",
     "tailwindcss": "3.4.4",

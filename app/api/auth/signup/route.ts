@@ -3,6 +3,7 @@ import { getUserByEmail, createUser } from '@/lib/db'
 import { hashPassword } from '@/lib/auth'
 import { getServerClient } from '@/lib/supabaseServer'
 import { persistProfile, supabaseSignUp } from '@/lib/persist'
+import { checkRateLimit } from '@/lib/rateLimit'
 
 export async function POST(req: Request) {
   try {
@@ -16,6 +17,15 @@ export async function POST(req: Request) {
     }
     if (password.length < 6) {
       return NextResponse.json({ error: 'Password must be at least 6 characters.' }, { status: 400 })
+    }
+    // Anti-spam backstop, keyed per EMAIL (not per IP) for the same NAT reason
+    // as login: a college's shared IP must never throttle real sign-ups.
+    const rl = checkRateLimit(`signup:${email.toLowerCase()}`, 5, 60_000)
+    if (!rl.allowed) {
+      return NextResponse.json(
+        { error: 'Too many sign-up attempts for this email — please wait a minute.' },
+        { status: 429, headers: { 'Retry-After': String(rl.retryAfterSec) } },
+      )
     }
 
     // Supabase mode: email + password live in Supabase Auth, profile row mirrors onboarding.

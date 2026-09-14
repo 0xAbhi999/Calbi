@@ -4,6 +4,7 @@ import { verifyPassword } from '@/lib/auth'
 import { isProfileComplete } from '@/lib/validate'
 import { getServerClient } from '@/lib/supabaseServer'
 import { fetchProfile, hasAssessmentResult, supabaseSignIn } from '@/lib/persist'
+import { checkRateLimit } from '@/lib/rateLimit'
 
 export async function POST(req: Request) {
   try {
@@ -15,6 +16,16 @@ export async function POST(req: Request) {
     }
     if (!password || password.length < 6) {
       return NextResponse.json({ error: 'Password must be at least 6 characters.' }, { status: 400 })
+    }
+    // Brute-force backstop, keyed per EMAIL (not per IP) so a whole college
+    // behind one NAT IP logging in at exam start is never throttled, while a
+    // targeted attack on a single account is.
+    const rl = checkRateLimit(`login:${email.toLowerCase()}`, 10, 60_000)
+    if (!rl.allowed) {
+      return NextResponse.json(
+        { error: 'Too many sign-in attempts — please wait a minute and try again.' },
+        { status: 429, headers: { 'Retry-After': String(rl.retryAfterSec) } },
+      )
     }
 
     // Supabase mode: verify credentials against Supabase Auth.

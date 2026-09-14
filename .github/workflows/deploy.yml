@@ -31,8 +31,18 @@ jobs:
             # 2) Your app lives here (already cloned on the server)
             cd "$HOME/know-yourself"
 
-            # 3) Pull the PR branch that triggered this run
+            # 3) Pull the PR branch that triggered this run.
+            #    The app writes demo-mode runtime data into calibiai_db.json,
+            #    which used to make the checkout below abort with "Your local
+            #    changes ... would be overwritten by checkout". That data now
+            #    lives in calibiai_db.runtime.json (gitignored). Migrate any
+            #    existing live rows once, then make sure the tracked seed is
+            #    clean so the checkout can never fail again.
             BRANCH="${{ github.head_ref || github.ref_name }}"
+            if [ -f calibiai_db.json ] && [ ! -f calibiai_db.runtime.json ]; then
+              cp -f calibiai_db.json calibiai_db.runtime.json || true
+            fi
+            git checkout -- calibiai_db.json 2>/dev/null || true
             git fetch origin
             git checkout -B "$BRANCH" "origin/$BRANCH"
 

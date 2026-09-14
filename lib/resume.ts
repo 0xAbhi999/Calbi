@@ -7,6 +7,7 @@
 
 import mammoth from 'mammoth'
 import { PDFParse } from 'pdf-parse'
+import { fetchWithTimeout } from './fetchTimeout.ts'
 
 export const MAX_RESUME_BYTES = 5 * 1024 * 1024
 
@@ -115,7 +116,7 @@ async function callCalibiAi(text: string, ctx: CandidateContext): Promise<any | 
   const key = process.env.CALIBIAI_API_KEY || process.env.DEEPSEEK_API_KEY
   if (!key) return null
   try {
-    const res = await fetch(`${AI_BASE}/chat/completions`, {
+    const res = await fetchWithTimeout(`${AI_BASE}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
       body: JSON.stringify({
@@ -130,7 +131,7 @@ async function callCalibiAi(text: string, ctx: CandidateContext): Promise<any | 
           },
         ],
       }),
-    })
+    }, 20000)
     if (!res.ok) {
       console.error('CalibiAI resume error:', res.status, await res.text().catch(() => ''))
       return null

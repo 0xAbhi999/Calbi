@@ -132,6 +132,14 @@ create table if not exists public.assessment_results (
   created_at          timestamptz not null default now()
 );
 
+create index if not exists profiles_role_college_idx on public.profiles (role, college);
+create index if not exists assessment_results_student_created_idx
+  on public.assessment_results (student_id, created_at desc);
+create index if not exists assessment_sessions_student_created_idx
+  on public.assessment_sessions (student_id, created_at desc);
+create index if not exists assessment_sessions_status_student_idx
+  on public.assessment_sessions (status, student_id, created_at desc);
+
 -- ---------------------------------------------------------------------------
 -- AI evaluation jobs (CalibiAI) — for speaking/writing/code/prompts
 -- ---------------------------------------------------------------------------
@@ -219,8 +227,9 @@ create policy "own files" on storage.objects for all using (
 -- Download view — one row per student: profile + latest resume analysis +
 -- latest assessment result. Export from the Supabase table editor
 -- (CSV / Excel / JSON) to download all data in one click.
--- (Also provided as standalone migrations: 0002_profile_avatar_and_full_view.sql
---  and 0003_profile_prn.sql, which re-creates this view with the PRN column.)
+-- (Also provided as standalone migrations: 0002_profile_avatar_and_full_view.sql,
+--  0003_profile_prn.sql, and 0006_admin_attempted_and_stats.sql which adds
+--  assessment_attempted plus the admin_stats view below.)
 -- ============================================================================
 create or replace view public.student_profiles_full
 with (security_invoker = on)   -- RLS of the underlying tables still applies
@@ -259,7 +268,14 @@ select
   a.ai_feedback           as assessment_ai_feedback,
   a.verifiable_hash,
   a.report_storage_key    as report_storage_key,
-  a.created_at            as assessment_created_at
+  a.created_at            as assessment_created_at,
+  (a.session_id is not null
+    or exists (
+      select 1 from public.assessment_sessions s
+      where s.student_id = p.id
+        and (s.status in ('submitted', 'expired') or s.submitted_at is not null)
+    )
+  )                       as assessment_attempted
 from public.profiles p
 left join lateral (
   select ra.*
@@ -275,3 +291,119 @@ left join lateral (
   order by ar.created_at desc
   limit 1
 ) a on true;
+
+-- Single-row dashboard aggregates for GET /api/admin/meta (stat cards +
+-- college dropdown in one ~200-byte row instead of a full-table scan).
+create or replace view public.admin_stats
+with (security_invoker = on)   -- RLS of the underlying tables still applies
+as
+select
+  count(*)::int                                                     as total_students,
+  count(*) filter (where v.assessment_attempted)::int               as assessed_students,
+  count(v.talent_score)::int                                        as scored_students,
+  round(avg(v.talent_score))::int                                   as avg_score,
+  coalesce(
+    array_agg(distinct btrim(v.college))
+      filter (where v.college is not null and btrim(v.college) <> ''),
+    '{}'
+  )                                                                 as colleges
+from public.student_profiles_full v
+where v.role = 'student';
+
+-- ---------------------------------------------------------------------------
+-- Feedback submissions (post-assessment candidate feedback)
+-- "Which candidate gave which feedback" — written by /api/feedback, read back
+-- per student by the admin dashboard. Kept here as well as in
+-- supabase/migrations/0004_feedback_submissions.sql (that file is the one to
+-- run against an existing database).
+
+create table if not exists public.feedback_submissions (
+  id           uuid primary key default gen_random_uuid(),
+  -- Real Supabase user (null for local demo ids — see student_ref).
+  student_id   uuid references public.profiles(id) on delete set null,
+  -- Raw candidate id as sent by the client (`u_84368932`, a UUID, …).
+  student_ref  text,
+  email        text,
+  session_id   text,
+  rating       int  not null check (rating between 1 and 5),
+  message      text not null check (char_length(btrim(message)) >= 10),
+  source       text not null default 'web',
+  created_at   timestamptz not null default now()
+);
+
+create index if not exists feedback_submissions_student_id_idx
+  on public.feedback_submissions (student_id);
+create index if not exists feedback_submissions_student_ref_idx
+  on public.feedback_submissions (lower(student_ref));
+create index if not exists feedback_submissions_email_idx
+  on public.feedback_submissions (lower(email));
+create index if not exists feedback_submissions_created_at_idx
+  on public.feedback_submissions (created_at desc);
+create index if not exists feedback_submissions_student_ref_created_idx
+  on public.feedback_submissions (student_ref, created_at desc);
+create index if not exists feedback_submissions_email_created_idx
+  on public.feedback_submissions (lower(email), created_at desc);
+
+alter table public.feedback_submissions enable row level security;
+
+drop policy if exists feedback_insert_any on public.feedback_submissions;
+create policy feedback_insert_any on public.feedback_submissions
+  for insert with check (true);
+
+drop policy if exists feedback_select_own on public.feedback_submissions;
+create policy feedback_select_own on public.feedback_submissions
+  for select using (student_id = auth.uid());
+
+-- ---------------------------------------------------------------------------
+-- Help requests (in-app support form)
+-- Written by POST /api/help. Kept here as well as in
+-- supabase/migrations/0005_help_requests.sql (that file is the one to run
+-- against an existing database). Replaces the old direct browser POST to an
+-- external form service, which had a monthly submission limit.
+-- ---------------------------------------------------------------------------
+create table if not exists public.help_requests (
+  id           uuid primary key default gen_random_uuid(),
+  -- Real Supabase user (null when the request came from a local/demo id).
+  student_id   uuid references public.profiles(id) on delete set null,
+  -- Raw candidate id as sent by the client (`u_84368932`, a UUID, …).
+  student_ref  text,
+  email        text not null,
+  phone        text,
+  message      text not null check (char_length(btrim(message)) >= 10),
+  page         text,
+  source       text not null default 'web',
+  created_at   timestamptz not null default now()
+);
+
+create index if not exists help_requests_email_idx       on public.help_requests (lower(email));
+create index if not exists help_requests_created_at_idx  on public.help_requests (created_at desc);
+
+alter table public.help_requests enable row level security;
+
+-- Anyone may submit (contact form); the app writes with INSERT only, so no
+-- update policy exists and a submitted request cannot be rewritten.
+drop policy if exists help_requests_insert_any on public.help_requests;
+create policy help_requests_insert_any on public.help_requests
+  for insert with check (true);
+
+drop policy if exists help_requests_select_own on public.help_requests;
+create policy help_requests_select_own on public.help_requests
+  for select using (student_id = auth.uid());
+
+-- ---------------------------------------------------------------------------
+-- Low-egress admin change probe (migration 0007)
+-- ---------------------------------------------------------------------------
+create or replace view public.admin_change_probe
+with (security_invoker = on)
+as
+select
+  (select count(*)::int from public.profiles where role = 'student') as profiles_count,
+  (select count(*)::int from public.assessment_results) as results_count,
+  (select count(*)::int from public.resume_analyses) as resumes_count,
+  (select count(*)::int from public.assessment_sessions) as sessions_count,
+  (select count(*)::int from public.feedback_submissions) as feedback_count,
+  (select max(updated_at) from public.profiles where role = 'student') as profiles_stamp,
+  (select max(created_at) from public.assessment_results) as results_stamp,
+  (select max(created_at) from public.resume_analyses) as resumes_stamp,
+  (select max(coalesce(submitted_at, created_at)) from public.assessment_sessions) as sessions_stamp,
+  (select max(created_at) from public.feedback_submissions) as feedback_stamp;

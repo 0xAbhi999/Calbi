@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto'
 import { NextResponse } from 'next/server'
-import { saveAssessmentSession, getActiveSessionForStudent, getAssessmentSession, type AssessmentSession } from '@/lib/db'
+import { saveAssessmentSession, getActiveSessionForStudent, getAssessmentSession, flushDB, type AssessmentSession } from '@/lib/db'
 import { getServerClient } from '@/lib/supabaseServer'
 import { fetchActiveAssessmentSession, fetchAssessmentSession, persistAssessmentSession, toUuid } from '@/lib/persist'
 
@@ -43,7 +43,7 @@ export async function POST(req: Request) {
     // students look like they never took the assessment. A stable id is also
     // required — remapping a demo id on every request would create a new row
     // per save instead of updating the same session.
-    const id = toUuid(body.id) || toUuid(body.session_id) || randomUUID()
+    const id = toUuid(body.id, 'session') || toUuid(body.session_id, 'session') || randomUUID()
     const session: AssessmentSession = {
       id,
       student_id: body.student_id || body.user_id || '',
@@ -58,6 +58,9 @@ export async function POST(req: Request) {
       created_at: body.created_at || new Date().toISOString(),
     }
     saveAssessmentSession(session)
+    // The start of a 120-minute attempt must be on disk before the candidate
+    // proceeds, or a crash would lose the fact they ever started.
+    await flushDB()
     const sb = getServerClient()
     let supabase = false
     if (sb) supabase = await persistAssessmentSession(sb, session)

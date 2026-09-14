@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 
 import { CSV_COLUMNS, rowsToCsv, downloadFilename } from '../csv.ts'
 import { filterRows } from '../adminFilters.ts'
-import { buildRow, mergeSkills } from '../studentRows.ts'
+import { buildRow, fillAssessmentFrom, mergeSkills, mergeStudentRows } from '../studentRows.ts'
 
 /* ------------------------------------------------------------------ */
 /* mergeSkills                                                         */
@@ -97,6 +97,37 @@ test('buildRow leaves an unassessed student blank rather than zeroed', () => {
   assert.equal(row.resume_score, '')
 })
 
+test('buildRow marks a submitted session as taken even when the result is pending', () => {
+  const row = buildRow({
+    student_id: 'u_submitted',
+    email: 'submitted@college.edu',
+    profile: { full_name: 'Submitted Student' },
+    scores: null,
+    assessment_attempted: true,
+  })
+  assert.equal(row.has_assessment, 'Yes')
+  assert.equal(row.score, '')
+})
+
+test('fillAssessmentFrom keeps a completed local result when the live profile has no result yet', () => {
+  const live = buildRow({
+    student_id: '11111111-1111-1111-1111-111111111111',
+    email: 'same@college.edu',
+    profile: { full_name: 'Live Student' },
+    scores: null,
+  })
+  const local = buildRow({
+    student_id: 'u_same',
+    email: 'same@college.edu',
+    profile: { full_name: 'Local Student' },
+    scores: { total: 780, grade: 'A', percentile: 90 },
+  })
+  const merged = fillAssessmentFrom(live, local)
+  assert.equal(merged.has_assessment, 'Yes')
+  assert.equal(merged.score, '780')
+  assert.equal(merged.grade, 'A')
+})
+
 /* ------------------------------------------------------------------ */
 /* filterRows                                                          */
 /* ------------------------------------------------------------------ */
@@ -122,10 +153,10 @@ test('filterRows narrows by college (case-insensitive) and free search', () => {
 
 test('CSV columns cover personal, skills, resume and all module scores', () => {
   const labels = CSV_COLUMNS.map(c => c.label)
-  for (const required of ['Name', 'PRN', 'Mobile Number', 'College', 'Profile Skills', 'All Skills', 'CalibiAI Score (/1000)', 'English (/200)', 'Cognitive (/200)']) {
+  for (const required of ['Name', 'PRN', 'Mobile Number', 'College', 'Profile Skills', 'All Skills', 'CalibiAI Score (/1000)', 'English (/200)', 'Cognitive (/200)', 'Feedback Rating (1-5)', 'Feedback Comment']) {
     assert.ok(labels.includes(required), `missing column ${required}`)
   }
-  assert.equal(CSV_COLUMNS.length, 48)
+  assert.equal(CSV_COLUMNS.length, 52)
 })
 
 test('rowsToCsv adds BOM, CRLF, quotes and guards formula injection', () => {
@@ -145,4 +176,72 @@ test('rowsToCsv adds BOM, CRLF, quotes and guards formula injection', () => {
 test('downloadFilename embeds scope and today date', () => {
   const name = downloadFilename('all')
   assert.match(name, /^calibiai_students_all_\d{4}-\d{2}-\d{2}\.csv$/)
+})
+
+// ---------------------------------------------------------------------------
+// Merging the two stores the admin now reads (Supabase + local JSON demo file).
+// Students seeded into calibiai_db.json were never written to Postgres, and
+// students who signed up through the app exist only in Postgres — the dashboard
+// must show both without double-counting anyone.
+
+const mk = (student_id: string, email: string, name: string, score = '') =>
+  buildRow({
+    student_id,
+    email,
+    profile: { full_name: name },
+    scores: score ? { total: Number(score) } : null,
+  })
+
+test('mergeStudentRows keeps live rows and adds local-only candidates', () => {
+  const remote = [mk('11111111-1111-1111-1111-111111111111', 'live@x.com', 'Live Student', '90')]
+  const local = [mk('u_1', 'seed1@y.com', 'Seed One'), mk('u_2', 'seed2@y.com', 'Seed Two', '40')]
+  const merged = mergeStudentRows(remote, local)
+  assert.equal(merged.remote, 1)
+  assert.equal(merged.local, 2)
+  assert.equal(merged.rows.length, 3)
+  assert.deepEqual(merged.rows.map(r => r.name).sort(), ['Live Student', 'Seed One', 'Seed Two'])
+  // The live row keeps its score, the local one keeps its own.
+  assert.equal(merged.rows.find(r => r.name === 'Live Student')?.score, '90')
+  assert.equal(merged.rows.find(r => r.name === 'Seed One')?.score, '')
+})
+
+test('mergeStudentRows de-dupes the same student id, and the live row wins', () => {
+  const id = '22222222-2222-2222-2222-222222222222'
+  const remote = [mk(id, 'same@x.com', 'Live Name', '88')]
+  const local = [mk(id, 'same@x.com', 'Local Name', '11')]
+  const merged = mergeStudentRows(remote, local)
+  assert.equal(merged.local, 0)
+  assert.equal(merged.rows.length, 1)
+  assert.equal(merged.rows[0].name, 'Live Name')
+  assert.equal(merged.rows[0].score, '88')
+})
+
+test('mergeStudentRows de-dupes the same person when the ids differ (id vs email)', () => {
+  // The same human as a real Supabase UUID and as a legacy `u_…` demo id.
+  const remote = [mk('33333333-3333-3333-3333-333333333333', 'Prajwal@Gmail.com', 'Prajwal (live)', '95')]
+  const local = [mk('u_84368932', 'prajwal@gmail.com', 'Prajwal (demo)', '60')]
+  const merged = mergeStudentRows(remote, local)
+  assert.equal(merged.remote, 1)
+  assert.equal(merged.local, 0)
+  assert.equal(merged.rows.length, 1)
+  assert.equal(merged.rows[0].name, 'Prajwal (live)')
+})
+
+test('mergeStudentRows never drops local rows that share an email with each other', () => {
+  // The seeded store legitimately holds several attempts per email; they have
+  // always been listed separately and must stay that way.
+  const remote: ReturnType<typeof mk>[] = []
+  const local = [
+    mk('u_a', 'repeat@y.com', 'Repeat A', '40'),
+    mk('u_b', 'repeat@y.com', 'Repeat B', '96'),
+  ]
+  const merged = mergeStudentRows(remote, local)
+  assert.equal(merged.local, 2)
+  assert.equal(merged.rows.length, 2)
+})
+
+test('mergeStudentRows tolerates blank ids/emails without merging unrelated rows', () => {
+  const merged = mergeStudentRows([], [mk('', '', 'No Id'), mk('u_c', '', 'No Email')])
+  assert.equal(merged.local, 2)
+  assert.equal(merged.rows.length, 2)
 })

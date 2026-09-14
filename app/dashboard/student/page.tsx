@@ -1,12 +1,14 @@
 'use client'
 export const dynamic = 'force-dynamic'
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { FeedbackGate } from '@/components/FeedbackGate'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { Navbar } from '@/components/Navbar'
 import { useStore } from '@/lib/store'
 import { isProfileComplete } from '@/lib/validate'
 import { consumeJustSubmittedTicket } from '@/lib/justSubmitted'
+import { readFeedbackDraft } from '@/lib/feedback'
 import { flattenAssessmentResult } from '@/lib/resultShape'
 import { getLiveUser } from '@/lib/session'
 import { ReportModal } from '@/components/ReportModal'
@@ -20,6 +22,9 @@ function Inner(){
   const [downloading, setDownloading] = useState(false)
   // True only on the landing right after the assessment was submitted.
   const [justCompleted, setJustCompleted] = useState(false)
+  // True when the candidate left the feedback step unfinished ("Skip for now"),
+  // so the dashboard can offer to finish it — without ever forcing them back.
+  const [feedbackPendingDraft, setFeedbackPendingDraft] = useState(false)
   const ticketChecked = useRef(false)
   // True once the cached account has been validated against Supabase Auth.
   const [validated, setValidated] = useState(false)
@@ -46,7 +51,13 @@ function Inner(){
       setValidated(true)
     })()
     return () => { cancelled = true }
-  },[hydrated, user, router, setUser, reconcileForUser])
+  // Only the account id controls this auth check. The store exposes setter
+  // functions through context; depending on their render-time identities made
+  // this effect run again after every profile/score update and created a
+  // request storm (hundreds of /profiles and /assessment_results reads per
+  // minute for one student).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[hydrated, user?.id])
 
   // The assessment page hands the candidate here after submitting and leaves a
   // single-use ticket behind, so this is where "assessment complete" is
@@ -58,15 +69,34 @@ function Inner(){
     setJustCompleted(consumeJustSubmittedTicket())
   },[])
 
+  // Two housekeeping jobs on arrival:
+  //  1. push any feedback/help request the server had to queue (a failed
+  //     Supabase write is retried here, so nothing is ever lost), and
+  //  2. notice an unfinished feedback draft so we can offer to complete it.
+  useEffect(()=>{
+    fetch('/api/feedback/flush', { method: 'POST' }).catch(()=>{})
+    const checkDraft = () => setFeedbackPendingDraft(!!readFeedbackDraft())
+    checkDraft()
+    window.addEventListener('storage', checkDraft)
+    return () => window.removeEventListener('storage', checkDraft)
+  },[])
+
   // Enrich the (locally hydrated) store with the latest DB data when signed in.
   // Data is written through the store so the navbar and every other page sees
   // the same profile — including the full name set on the profile page.
   // Extracted into a `refresh` so it can also run on window focus (returning
   // from the edit-profile / update-resume pages) so the score is always live.
-  const refresh = useCallback(()=>{
+  // Focus events fire far more often than data changes (alt-tab, devtools,
+  // notifications). Throttle background re-syncs to one per minute so a
+  // student idling on the dashboard doesn't re-pull their rows constantly.
+  const lastRefreshRef = useRef(0)
+  const refresh = useCallback((force = false)=>{
     // Wait until the cached account has been validated (and possibly reconciled
     // to a different live user) so we never fetch the previous account's data.
     if(!user?.id || !validated) return
+    const now = Date.now()
+    if(!force && now - lastRefreshRef.current < 60000) return
+    lastRefreshRef.current = now
     fetch('/api/user/profile?user_id='+user.id).then(r=>r.json()).then(data=>{
       if(data.profile) setProfile(data.profile)
     }).catch(()=>{})
@@ -79,10 +109,14 @@ function Inner(){
       // screen or in the downloaded PDF.
       setScores(flattenAssessmentResult(data.result))
     }).catch(()=>{})
-  },[user?.id, validated, setProfile, setResume, setScores])
+  // The setters are intentionally omitted: they are context wrappers whose
+  // identity changes when the store updates. Including them recreates `refresh`,
+  // which re-runs the forced refresh effect and loops back into Supabase.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[user?.id, validated])
 
   useEffect(()=>{
-    refresh()
+    refresh(true)
   },[refresh])
 
   // Re-sync when the user returns to this tab (e.g. after editing their profile
@@ -151,6 +185,25 @@ function Inner(){
                   View my full report →
                 </button>
               )}
+            </div>
+          </div>
+        )}
+
+        {feedbackPendingDraft && (
+          <div className="mt-6 animate-fade-up rounded-3xl border border-violet-200 bg-violet-50/80 p-5 shadow-sm">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div className="flex items-start gap-3">
+                <span className="text-2xl" aria-hidden>💬</span>
+                <div>
+                  <div className="text-sm font-black text-violet-800">You skipped the feedback step</div>
+                  <p className="mt-1 text-xs text-violet-700">
+                    It takes 20 seconds and tells us what to improve. We kept what you typed.
+                  </p>
+                </div>
+              </div>
+              <Link href="/feedback" className="btn-primary !py-2.5 text-xs" onClick={()=>setFeedbackPendingDraft(false)}>
+                Give feedback →
+              </Link>
             </div>
           </div>
         )}
@@ -260,4 +313,4 @@ function Inner(){
     </div>
   )
 }
-export default function Page(){ return <Inner/> }
+export default function Page(){ return <FeedbackGate><Inner/></FeedbackGate> }

@@ -4,6 +4,17 @@
 // CSV from the rows it already fetched, so a download always matches the
 // filters on screen exactly.
 
+export interface AdminFeedbackEntry {
+  id: string
+  student_id: string
+  email: string
+  rating: string
+  message: string
+  session_id: string
+  source: string
+  created_at: string
+}
+
 export interface AdminStudentRow {
   student_id: string
   email: string
@@ -60,6 +71,13 @@ export interface AdminStudentRow {
   logical_total: string
   verifiable_hash: string
   assessed_at: string
+  // Feedback the candidate gave about the assessment (latest submission)
+  feedback_rating: string
+  feedback_message: string
+  feedback_at: string
+  feedback_count: string
+  /** Every submission, newest first; the table fields above are the latest one. */
+  feedback_history?: AdminFeedbackEntry[]
 }
 
 export const CSV_COLUMNS: { key: keyof AdminStudentRow; label: string }[] = [
@@ -109,6 +127,10 @@ export const CSV_COLUMNS: { key: keyof AdminStudentRow; label: string }[] = [
   { key: 'problem_total', label: 'Problem Solving Total' },
   { key: 'logical_correct', label: 'Logical Correct' },
   { key: 'logical_total', label: 'Logical Total' },
+  { key: 'feedback_rating', label: 'Feedback Rating (1-5)' },
+  { key: 'feedback_message', label: 'Feedback Comment' },
+  { key: 'feedback_at', label: 'Feedback Date' },
+  { key: 'feedback_count', label: 'Feedback Submissions' },
   { key: 'verifiable_hash', label: 'Verifiable Hash' },
   { key: 'assessed_at', label: 'Assessment Date' },
 ]

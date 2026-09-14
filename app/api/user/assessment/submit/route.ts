@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto'
 import { NextResponse } from 'next/server'
-import { saveAssessmentResult, saveAssessmentSession, getAssessmentSession, type AssessmentSession } from '@/lib/db'
+import { saveAssessmentResult, saveAssessmentSession, getAssessmentSession, flushDB, type AssessmentSession } from '@/lib/db'
 import { getServerClient } from '@/lib/supabaseServer'
 import { persistAssessmentResult, persistAssessmentSession, toUuid } from '@/lib/persist'
 
@@ -10,10 +10,19 @@ export async function POST(req: Request) {
     // Local demo ids ("sess_xyz") are not valid Postgres uuids — map them so
     // the result row actually lands in Supabase (the row-level mirror silently
     // failed before, so returners looked like they never took the assessment).
-    const sessionId = toUuid(body.session_id) || randomUUID()
-    const studentId = body.student_id || body.user_id || (body.result?.student_id) || ''
+    const sessionId = toUuid(body.session_id, 'session') || randomUUID()
+    // A hydrated client normally sends the user id. If the final submit races
+    // the client store hydration, recover it from the already-saved session
+    // instead of writing the result under "unknown" / a random UUID. That
+    // mismatch is what made completed tests appear as "Not taken" in admin.
+    // Keep the local JSON store in sync under the same uuid.
+    let s: AssessmentSession | undefined = getAssessmentSession(body.session_id || '') || getAssessmentSession(sessionId)
+    const suppliedStudentId = String(body.student_id || body.user_id || body.result?.student_id || '').trim()
+    const studentId = suppliedStudentId && suppliedStudentId !== 'unknown'
+      ? suppliedStudentId
+      : String(s?.student_id || '').trim()
     const result = {
-      id: toUuid(body.id) || 'res_' + Math.random().toString(16).slice(2, 10),
+      id: toUuid(body.id, 'result') || 'res_' + Math.random().toString(16).slice(2, 10),
       session_id: sessionId,
       student_id: studentId,
       scores: body.scores || {},
@@ -24,8 +33,6 @@ export async function POST(req: Request) {
       ai_feedback: body.ai_feedback || {},
       created_at: new Date().toISOString(),
     }
-    // Keep the local JSON store in sync under the same uuid.
-    let s: AssessmentSession | undefined = getAssessmentSession(body.session_id || '') || getAssessmentSession(sessionId)
     if (!s) {
       s = {
         id: sessionId,
@@ -46,6 +53,9 @@ export async function POST(req: Request) {
     s.submitted_at = new Date().toISOString()
     saveAssessmentSession(s)
     saveAssessmentResult(result)
+    // A final submit is the one write that must be durable before we answer —
+    // force the (coalesced) flush to disk, never just hope it happens later.
+    await flushDB()
     // Mirror to Supabase: session status first (FK for the result row), then
     // the result — this is what makes the score survive a re-login.
     let supabase = false

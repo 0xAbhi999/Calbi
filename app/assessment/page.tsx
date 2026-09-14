@@ -8,7 +8,9 @@ import { bank, shuffledOptions, shuffledChoiceOptions, mulberry32 } from '@/lib/
 import { computeScores } from '@/lib/scoring'
 import { getSupabase } from '@/lib/supabase'
 import { AFTER_ASSESSMENT_ROUTE } from '@/lib/nextStep'
+import { markFeedbackPending } from '@/lib/feedback'
 import { markJustSubmitted } from '@/lib/justSubmitted'
+import { HelpButton } from '@/components/HelpButton'
 import { Logo } from '@/components/Logo'
 import { AiExamAssistant } from '@/components/AiExamAssistant'
 import { AssessmentReview } from '@/components/AssessmentReview'
@@ -260,6 +262,10 @@ function AssessmentInner() {
   const [envBlockReason, setEnvBlockReason] = useState<string | null>(null)
   const [envConsent, setEnvConsent] = useState(false)
   const [envBusy, setEnvBusy] = useState(false)
+  // True when the candidate denied (or the browser blocked) the fullscreen
+  // permission at the pre-test gate — fullscreen is a hard requirement, so the
+  // test must not start in a normal window.
+  const [fsBlocked, setFsBlocked] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
   // Whether fullscreen was actually engaged at the gate (state twin of
   // envFsEngagedRef so the UI can render on it).
@@ -297,6 +303,16 @@ function AssessmentInner() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const awayRef = useRef(false)
   const suppressRef = useRef(false)
+  // Timer that re-arms the proctoring monitors once a native fullscreen
+  // permission prompt has been answered (see `enterFullscreen` below).
+  const fsSuppressTimerRef = useRef<any>(null)
+  // Throttled server autosave (see the `[answers, sid]` effect below). The
+  // browser keeps every keystroke in localStorage; Postgres only receives a
+  // checkpoint at most once per 10 seconds. The final submit always sends the
+  // complete answer set, so this is a durability checkpoint rather than a
+  // source of truth.
+  const autosaveTimerRef = useRef<any>(null)
+  const autosaveLastSentRef = useRef(0)
   const strikesRef = useRef(0)
   // Timestamp of the last recorded strike — used to coalesce the burst of
   // blur/visibility/fullscreen events a single action produces.
@@ -395,31 +411,116 @@ function AssessmentInner() {
   useEffect(() => {
     if (sid) {
       localStorage.setItem('calibiai_answers_' + sid, JSON.stringify(answers))
-      try {
+      // Server autosave is debounced AND throttled: typing a sentence would
+      // otherwise fire a write after every pause. LocalStorage is the fast,
+      // per-keystroke recovery layer; Postgres is a checkpoint no more often
+      // than once per 10 seconds. The final submit persists the latest state.
+      if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current)
+      const minInterval = 10_000
+      const wait = Math.max(1_500, minInterval - (Date.now() - autosaveLastSentRef.current))
+      autosaveTimerRef.current = setTimeout(() => {
+        autosaveTimerRef.current = null
+        autosaveLastSentRef.current = Date.now()
         fetch('/api/user/assessment', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ session_id: sid, answers, status: 'in_progress' }),
-        })
-      } catch { /* demo mode */ }
+          body: JSON.stringify({ session_id: sid, student_id: user?.id || '', answers, status: 'in_progress' }),
+        }).catch(() => { /* localStorage remains the recovery layer */ })
+      }, wait)
     }
-  }, [answers, sid])
+  }, [answers, sid, user?.id])
   useEffect(() => { if (sid) localStorage.setItem('calibiai_ai_' + sid, JSON.stringify(aiResults)) }, [aiResults, sid])
 
   const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 3200) }
 
+  /* ------------------------------------------------------------------ */
+  /* Permission-prompt suppression guard                                 */
+  /*                                                                     */
+  /* Asking the browser for a NEW permission (camera, mic, fullscreen,   */
+  /* screen-list) pops a NATIVE prompt that takes focus away from the    */
+  /* page and, in some browsers, briefly drops out of fullscreen. None   */
+  /* of that is a real tab-switch / fullscreen-exit, so it must never    */
+  /* count as a proctoring violation or fire the re-enter-fullscreen     */
+  /* lock. This guard holds `suppressRef` true for the whole native      */
+  /* prompt window (until the browser resolves it, plus a small buffer   */
+  /* for the trailing blur/visibility/fullscreenchange burst) so the     */
+  /* violation monitors stay quiet while the user simply grants a        */
+  /* permission. Every request that can raise a native prompt must run   */
+  /* through it.                                                         */
+  /* ------------------------------------------------------------------ */
+  const withPromptGuard = async <T,>(fn: () => Promise<T>): Promise<T> => {
+    suppressRef.current = true
+    if (fsSuppressTimerRef.current) { clearTimeout(fsSuppressTimerRef.current); fsSuppressTimerRef.current = null }
+    try {
+      return await fn()
+    } finally {
+      // Absorb the trailing blur/visibility/fullscreenchange burst that
+      // follows the user answering the prompt, then re-arm the monitors.
+      fsSuppressTimerRef.current = setTimeout(() => {
+        suppressRef.current = false
+        fsSuppressTimerRef.current = null
+      }, 1500)
+    }
+  }
+
+  // Request fullscreen while pausing the focus/fullscreen proctoring monitors.
+  // The native "Allow fullscreen?" permission prompt blurs the window (and some
+  // browsers briefly report the page as not-fullscreen) — none of that is a real
+  // tab switch or fullscreen exit, so it must not count as a warning.
+  const enterFullscreen = async (): Promise<boolean> => {
+    return withPromptGuard(async () => {
+      let engaged = false
+      try {
+        engaged = await safeRequestFullscreen(document)
+      } catch {
+        engaged = false
+      }
+      return engaged
+    })
+  }
+
+  // Release the proctoring camera + microphone stream and its preview, and stop
+  // any in-flight speaking MediaRecorder. Call once whenever the assessment
+  // concludes so the camera/mic light turns off and the stream is freed.
+  // This pure version never touches React state, so it is safe to call from an
+  // unmount cleanup (state updates are meaningless once the tree is gone).
+  const stopTracks = () => {
+    // Stop an active speaking-recording MediaRecorder first.
+    try { mediaRef.current?.stop() } catch { /* already stopped */ }
+    mediaRef.current = null
+    // Stop every track of the proctoring stream (camera + mic).
+    proctorStreamRef.current?.getTracks().forEach(t => t.stop())
+    proctorStreamRef.current = null
+    // Detach the preview so the video element fully releases the device.
+    if (videoRef.current) {
+      try { videoRef.current.srcObject = null } catch { /* noop */ }
+    }
+  }
+  // Stateful twin of stopTracks for use while the page is still mounted, so the
+  // live-preview UI reflects the camera being released.
+  const releaseMedia = () => {
+    stopTracks()
+    setVideoOn(false)
+    setMediaReady(false)
+    mediaReadyRef.current = false
+  }
+
   const enableMedia = async () => {
     setMediaError('')
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-      proctorStreamRef.current = stream
-      setMediaReady(true); mediaReadyRef.current = true; setVideoOn(true)
-    } catch (e: any) {
-      setMediaError(e?.name === 'NotAllowedError'
-        ? 'Camera/mic permission was denied. The live preview is off, but focus monitoring is still active.'
-        : 'No camera/mic detected on this device. Focus monitoring is still active.')
-      setMediaReady(true); mediaReadyRef.current = true
-    }
+    // Asking for the camera/mic raises a native permission prompt that steals
+    // focus — suppress it so it never becomes a proctoring violation.
+    await withPromptGuard(async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+        proctorStreamRef.current = stream
+        setMediaReady(true); mediaReadyRef.current = true; setVideoOn(true)
+      } catch (e: any) {
+        setMediaError(e?.name === 'NotAllowedError'
+          ? 'Camera/mic permission was denied. The live preview is off, but focus monitoring is still active.'
+          : 'No camera/mic detected on this device. Focus monitoring is still active.')
+        setMediaReady(true); mediaReadyRef.current = true
+      }
+    })
   }
 
   useEffect(() => {
@@ -455,7 +556,13 @@ function AssessmentInner() {
     }
   }, [terminated])
 
-  useEffect(() => () => { proctorStreamRef.current?.getTracks().forEach(t => t.stop()) }, [])
+  useEffect(() => () => {
+    // Assessment page is leaving (submit → results, session already finished,
+    // or the user navigated/closed away) — release the camera/mic now.
+    stopTracks()
+    if (fsSuppressTimerRef.current) clearTimeout(fsSuppressTimerRef.current)
+    if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current)
+  }, [])
 
   /* ------------------------------------------------------------------ */
   /* Anti-cheat environment lock                                         */
@@ -483,7 +590,7 @@ function AssessmentInner() {
     let running = false
 
     const bumpStrike = (msg: string) => {
-      if (terminated || submittingRef.current) return
+      if (terminated || submittingRef.current || suppressRef.current) return
       // Same coalescing as onLeave — a fullscreen exit that follows a blur from
       // the same user action must not count as a second, separate strike.
       if (Date.now() - lastStrikeAtRef.current < STRIKE_COOLDOWN_MS) return
@@ -555,9 +662,11 @@ function AssessmentInner() {
     let timer: any = null
 
     const reenter = () => {
-      if (document.fullscreenElement || submittingRef.current) return
+      // Skip while a native permission prompt (camera/mic/fullscreen) is up —
+      // requesting fullscreen then would just re-prompt and could blur-flicker.
+      if (suppressRef.current || document.fullscreenElement || submittingRef.current) return
       const attempt = async () => {
-        if (document.fullscreenElement || submittingRef.current) return
+        if (suppressRef.current || document.fullscreenElement || submittingRef.current) return
         const ok = await safeRequestFullscreen(document)
         if (ok) {
           showToast('Fullscreen restored — it must stay on for the whole test.')
@@ -575,6 +684,7 @@ function AssessmentInner() {
     }
 
     const onFsChange = () => {
+      if (suppressRef.current) return
       if (!document.fullscreenElement) reenter()
     }
     document.addEventListener('fullscreenchange', onFsChange)
@@ -591,15 +701,26 @@ function AssessmentInner() {
   // one display is reachable.
   const runEnvCheck = async () => {
     setEnvBusy(true)
+    setFsBlocked(false)
     try {
-      // `safeRequestFullscreen` never rejects — it returns false when the
-      // browser's Permissions Policy blocks fullscreen (e.g. embedded in an
-      // iframe without `allow="fullscreen"`), so no unhandled rejection can
-      // surface as a runtime error.
-      const fsEngaged = await safeRequestFullscreen(document)
+      // `enterFullscreen` never rejects — it returns false when the user denies
+      // (or the browser's Permissions Policy blocks) fullscreen, e.g. embedded
+      // in an iframe without `allow="fullscreen"`, so no unhandled rejection
+      // can surface as a runtime error.
+      const fsEngaged = await enterFullscreen()
       envFsEngagedRef.current = fsEngaged
       setFsEngaged(fsEngaged)
       setIsFullscreen(!!document.fullscreenElement)
+
+      if (!fsEngaged) {
+        // Fullscreen is a hard requirement. If the candidate denied the
+        // permission we keep the gate locked and ask them to enable it instead
+        // of letting the test run in a normal window.
+        setFsBlocked(true)
+        setEnvState('gate')
+        return
+      }
+
       const facts = await resolveScreenFacts(window)
       const verdict = evaluateStartGate(facts)
       if (!verdict.allow) {
@@ -665,21 +786,42 @@ function AssessmentInner() {
   const startRecording = async (id: string) => {
     try {
       const proctorAudio = proctorStreamRef.current?.getAudioTracks()[0]
-      const stream = proctorAudio ? new MediaStream([proctorAudio]) : await navigator.mediaDevices.getUserMedia({ audio: true })
+      // Only request a fresh mic stream when we don't already own one from the
+      // proctor stream — and when we do (e.g. the candidate continued without
+      // camera), wrap it so the NATIVE mic permission prompt that appears
+      // mid-test never counts as a proctoring violation.
+      const acquireStream = () =>
+        proctorAudio
+          ? Promise.resolve(new MediaStream([proctorAudio]))
+          : navigator.mediaDevices.getUserMedia({ audio: true })
+      const stream = await withPromptGuard(acquireStream)
       const ownsStream = !proctorAudio
-      const rec = new MediaRecorder(stream)
+      // Prefer Opus-in-WebM explicitly and cap the bitrate at 32 kbps: speech
+      // stays perfectly intelligible while uploads shrink ~4x vs the browser
+      // default (~128 kbps) — a 2-minute answer drops from ~1.9MB to ~0.5MB.
+      // That is what keeps the free Supabase Storage quota (1GB) alive once
+      // hundreds of candidates record speaking answers.
+      let mime = ''
+      for (const cand of ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4']) {
+        try { if (MediaRecorder.isTypeSupported(cand)) { mime = cand; break } } catch { /* ignore */ }
+      }
+      const rec = new MediaRecorder(stream, {
+        ...(mime ? { mimeType: mime } : {}),
+        audioBitsPerSecond: 32000,
+      })
       chunksRef.current = []
       rec.ondataavailable = e => chunksRef.current.push(e.data)
       rec.onstop = async () => {
         const blob = new Blob(chunksRef.current, { type: rec.mimeType || 'audio/webm' })
         if (ownsStream) stream.getTracks().forEach(t => t.stop())
-        const meta = { name: id + '.webm', size: blob.size, type: blob.type, at: new Date().toISOString(), uploaded: false }
+        const ext = blob.type.includes('mp4') || blob.type.includes('m4a') ? 'm4a' : 'webm'
+        const meta = { name: id + '.' + ext, size: blob.size, type: blob.type, at: new Date().toISOString(), uploaded: false }
         const sb = getSupabase()
         if (sb && sid) {
           try {
             const { data: { user } } = await sb.auth.getUser()
             if (user) {
-              const up = await sb.storage.from('speaking').upload(`${user.id}/${sid}/${id}.webm`, blob, { contentType: blob.type, upsert: true })
+              const up = await sb.storage.from('speaking').upload(`${user.id}/${sid}/${id}.${ext}`, blob, { contentType: blob.type, upsert: true })
               if (!up.error) meta.uploaded = true
             }
           } catch { }
@@ -824,18 +966,24 @@ function AssessmentInner() {
     setSubmitting(true)
     setShowReview(false)
     clearInterval(intervalRef.current)
-    proctorStreamRef.current?.getTracks().forEach(t => t.stop())
-    proctorStreamRef.current = null
+    // The assessment is over — release the camera/mic stream automatically so
+    // the device stops recording the moment submission begins.
+    releaseMedia()
     const scores = computeScores(answers, aiResults, { gridAcc: answers['GRID'], speakingCount })
     const payload = { session_id: sid || 'sess_demo', ...scores, tab_switches: strikes, auto_submitted: !!auto, submitted_at: new Date().toISOString() }
     localStorage.setItem('calibiai_scores', JSON.stringify(payload))
     setScores(payload)
-    const sb = getSupabase()
+    // The server API is the single persistence boundary. The previous client
+    // implementation also called Supabase directly after these two API calls,
+    // which duplicated every final session/result write and bypassed the
+    // server's deterministic id mapping and retry/error handling. Apart from
+    // doubling database work, that race could leave the session and result out
+    // of sync. Keep browser code transport-only; the API owns Postgres writes.
     try {
       await fetch('/api/user/assessment', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sid, answers, status: auto ? 'expired' : 'submitted', tab_switches: strikes, submitted_at: new Date().toISOString() }),
+        body: JSON.stringify({ session_id: sid, student_id: user?.id || '', answers, status: auto ? 'expired' : 'submitted', tab_switches: strikes, submitted_at: new Date().toISOString() }),
       })
       await fetch('/api/user/assessment/submit', {
         method: 'POST',
@@ -843,23 +991,14 @@ function AssessmentInner() {
         body: JSON.stringify({ session_id: sid, student_id: user?.id || 'unknown', scores: payload, total: payload.total, grade: payload.grade, percentile: payload.percentile, verifiable_hash: payload.verifiable_hash, ai_feedback: aiResults }),
       })
     } catch (e) { /* demo mode */ }
-    if (sb && sid) {
-      try {
-        const { data: { user: authUser } } = await sb.auth.getUser()
-        if (authUser) {
-          await sb.from('assessment_sessions').update({ answers, status: auto ? 'expired' : 'submitted', submitted_at: new Date().toISOString(), tab_switches: strikes }).eq('id', sid)
-          await sb.from('assessment_results').upsert(
-            { session_id: sid, student_id: authUser.id, scores: payload, total: payload.total, grade: payload.grade, percentile: payload.percentile, verifiable_hash: payload.verifiable_hash, ai_feedback: aiResults },
-            { onConflict: 'session_id' },
-          )
-        }
-      } catch (e) { /* demo mode */ }
-    }
     const s = JSON.parse(localStorage.getItem('calibiai_session') || '{}')
     s.status = 'submitted'
     localStorage.setItem('calibiai_session', JSON.stringify(s))
+    // Timestamped ticket: it expires, and a stale one is cleared by
+    // FeedbackGate, so a failed feedback save can never strand the candidate.
+    markFeedbackPending(sid || 'sess_demo')
     markJustSubmitted()
-    router.replace(AFTER_ASSESSMENT_ROUTE)
+    router.replace('/feedback')
   }
   useEffect(() => { submitRef.current = doSubmit })
 
@@ -875,6 +1014,9 @@ function AssessmentInner() {
     setTerminated(true)
     setReviewMode('auto')
     setShowReview(true)
+    // Assessment is over (time-up / 3rd warning) — turn the camera & mic off
+    // now rather than keeping them live through the read-only review page.
+    releaseMedia()
   }
   useEffect(() => { autoSubmitRef.current = beginAutoSubmit })
 
@@ -1492,13 +1634,14 @@ function AssessmentInner() {
             <span className="hidden md:inline text-[11px] text-slate-400 font-mono">{String(sid).slice(0, 13)}…</span>
           </div>
           <div className="flex items-center gap-2.5 sm:gap-3">
+            <HelpButton assessment disabled={terminated || submitting || showViolation || !!reviewMode} />
             <span className="hidden sm:flex items-center gap-1.5 text-xs text-slate-500">
               Warnings
               <span className={`px-2 py-0.5 rounded-full font-bold ${strikes >= 3 ? 'bg-rose-500 text-white' : strikes >= 1 ? 'bg-amber-400 text-slate-900' : 'bg-slate-100 text-slate-500'}`}>{strikes}/3</span>
             </span>
             {envState === 'cleared' && !terminated && !submitting && !isFullscreen && (
               <button
-                onClick={() => { safeRequestFullscreen(document) }}
+                onClick={() => { enterFullscreen() }}
                 title="Re-enter fullscreen"
                 className="inline-flex items-center gap-1.5 rounded-full border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs font-bold text-amber-700 transition hover:bg-amber-100 active:scale-95"
               >
@@ -1708,9 +1851,15 @@ function AssessmentInner() {
               I confirm I have closed all other tabs and windows, and I will not connect or mirror an external display during the test.
             </label>
 
+            {fsBlocked && (
+              <div className="mt-4 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs font-semibold text-rose-600 animate-fade-in">
+                Fullscreen permission was not granted. The assessment cannot run in a normal window — tap the button again and choose <b>Allow</b> when your browser asks. If you already blocked it, enable fullscreen for this site in your browser settings (or click the fullscreen icon in the address bar) and try again.
+              </div>
+            )}
+
             <button onClick={runEnvCheck} disabled={!envConsent || envBusy}
               className={`mt-5 w-full rounded-full font-black text-sm transition ${envConsent && !envBusy ? 'btn-primary !py-3.5' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}>
-              {envBusy ? 'Checking environment…' : 'Enter fullscreen & begin security check →'}
+              {envBusy ? 'Checking environment…' : fsBlocked ? 'Re-enter fullscreen & re-check →' : 'Enter fullscreen & begin security check →'}
             </button>
           </div>
         </div>
@@ -1789,7 +1938,7 @@ function AssessmentInner() {
               The assessment must run in fullscreen. It is paused until you re-enter fullscreen.
             </p>
             <button
-              onClick={() => { safeRequestFullscreen(document) }}
+              onClick={() => { enterFullscreen() }}
               className="btn-primary mt-5 w-full !py-3"
             >
               <span className="inline-flex items-center gap-2"><Maximize2 className="h-4 w-4" aria-hidden /> Re-enter fullscreen</span>

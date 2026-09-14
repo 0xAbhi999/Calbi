@@ -5,7 +5,7 @@
 // configured (or the package is the compile-time stub) so callers fall back
 // to the local JSON demo store.
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
-import { isSupabaseConfigured } from './supabase'
+import { isSupabaseConfigured } from './supabase.ts'
 
 let cached: SupabaseClient | null | undefined
 

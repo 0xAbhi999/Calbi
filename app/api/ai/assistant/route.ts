@@ -6,8 +6,23 @@ export const runtime = 'nodejs'
 
 import { NextResponse } from 'next/server'
 import { chatWithAssistant, type AssistantRequest } from '@/lib/aiAssistant'
+import { checkRateLimit, getClientIp } from '@/lib/rateLimit'
+
+// The in-exam assistant is capped client-side at 5 prompts/task. The server
+// keeps only a generous per-IP *abuse backstop* (campuses share a NAT IP, so
+// per-IP limits must not throttle real students).
+const RATE_LIMIT = 1000
+const RATE_WINDOW_MS = 60_000
 
 export async function POST(req: Request) {
+  const rl = checkRateLimit(`assistant:${getClientIp(req)}`, RATE_LIMIT, RATE_WINDOW_MS)
+  if (!rl.allowed) {
+    return NextResponse.json(
+      { error: 'Too many assistant requests — slow down.' },
+      { status: 429, headers: { 'Retry-After': String(rl.retryAfterSec) } },
+    )
+  }
+
   let body: any
   try {
     body = await req.json()

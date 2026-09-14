@@ -2,12 +2,22 @@ import { NextResponse } from 'next/server'
 import { saveResumeAnalysis } from '@/lib/db'
 import { getServerClient } from '@/lib/supabaseServer'
 import { persistResumeAnalysis } from '@/lib/persist'
+import { createLimiter } from '@/lib/concurrency'
+import { checkRateLimit, getClientIp } from '@/lib/rateLimit'
 import {
   MAX_RESUME_BYTES,
   analyzeResumeText,
   extractResumeText,
   type CandidateContext,
 } from '@/lib/resume'
+
+// PDF/DOCX parsing + an LLM call is heavy; cap concurrent parses per worker so
+// a burst of uploads degrades to 429 instead of OOMing the process.
+const RESUME_PARSE_LIMIT = 4
+const resumeLimiter = createLimiter(RESUME_PARSE_LIMIT)
+// Per-IP *abuse backstop* only — campuses share a NAT IP, so keep it generous.
+const RATE_LIMIT = 300
+const RATE_WINDOW_MS = 60_000
 
 /**
  * POST multipart { file, user_id, full_name, email, degree, skills }
@@ -16,6 +26,20 @@ import {
  * including name-mismatch and professionalism flags.
  */
 export async function POST(req: Request) {
+  const rl = checkRateLimit(`resume:${getClientIp(req)}`, RATE_LIMIT, RATE_WINDOW_MS)
+  if (!rl.allowed) {
+    return NextResponse.json(
+      { error: 'Too many uploads — slow down.' },
+      { status: 429, headers: { 'Retry-After': String(rl.retryAfterSec) } },
+    )
+  }
+
+  if (!resumeLimiter.tryAcquire()) {
+    return NextResponse.json(
+      { error: 'Resume analysis is busy — please try again in a moment.' },
+      { status: 429, headers: { 'Retry-After': '3' } },
+    )
+  }
   try {
     const form = await req.formData()
     const file = form.get('file')
@@ -62,5 +86,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ analysis: record, supabase })
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || 'Resume analysis failed.' }, { status: 500 })
+  } finally {
+    resumeLimiter.release()
   }
 }

@@ -25,9 +25,14 @@ export interface AssistantResponse {
   suggestions?: string[]
 }
 
+import { fetchWithTimeout } from './fetchTimeout.ts'
+
 const AI_KEY = process.env.CALIBIAI_API_KEY || process.env.DEEPSEEK_API_KEY || ''
 const AI_BASE = process.env.CALIBIAI_BASE_URL || process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'
 const AI_MODEL = process.env.CALIBIAI_MODEL || process.env.DEEPSEEK_MODEL || 'deepseek-chat'
+// A hung assistant model must fall back to the heuristic engine, not hang the
+// exam under load.
+const AI_TIMEOUT_MS = 20000
 
 export function isCalibiAiConfigured(): boolean {
   return !!AI_KEY
@@ -47,7 +52,7 @@ async function callCalibiAiChat(
       })),
     ]
 
-    const res = await fetch(`${AI_BASE}/chat/completions`, {
+    const res = await fetchWithTimeout(`${AI_BASE}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AI_KEY}` },
       body: JSON.stringify({
@@ -55,7 +60,7 @@ async function callCalibiAiChat(
         temperature: 0.3,
         messages: formattedMessages,
       }),
-    })
+    }, AI_TIMEOUT_MS)
 
     if (!res.ok) {
       console.error('CalibiAI assistant error:', res.status, await res.text().catch(() => ''))

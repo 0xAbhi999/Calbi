@@ -3,6 +3,7 @@ import { useState, useRef, useEffect } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { useStore } from '@/lib/store'
+import { HelpButton } from '@/components/HelpButton'
 import { Logo } from '@/components/Logo'
 import { AiAvatar } from '@/components/AiAvatar'
 import { User, LogOut, ChevronDown, Users } from 'lucide-react'
@@ -55,6 +56,7 @@ export function Navbar() {
           <span className="font-extrabold tracking-tight text-slate-900 text-lg">CALIBIAI<span className="text-indigo-600"> SCORE</span></span>
         </Link>
         <div className="flex items-center gap-2 text-sm">
+          <HelpButton />
           {showCommunity && (
             <a
               href={COMMUNITY_APP_URL}

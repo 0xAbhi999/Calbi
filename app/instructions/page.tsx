@@ -111,12 +111,12 @@ function Inner(){
       }
     } catch (e) { /* fall through */ }
     if (!session) {
-      session = { id: 'sess_'+Math.random().toString(16).slice(2,10), started_at: new Date(now).toISOString(), expires_at: new Date(now+7200*1000).toISOString(), duration_sec: 7200, status:'in_progress', question_seed: seed }
+      session = { id: 'sess_'+Math.random().toString(16).slice(2,10), student_id: user?.id || '', started_at: new Date(now).toISOString(), expires_at: new Date(now+7200*1000).toISOString(), duration_sec: 7200, status:'in_progress', question_seed: seed }
       try {
         await fetch('/api/user/session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...session, student_id: user?.id || 'unknown' }),
+          body: JSON.stringify({ ...session, student_id: user?.id || session.student_id || 'unknown' }),
         })
       } catch { /* demo mode */ }
     }
