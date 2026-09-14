@@ -59,6 +59,9 @@ const files = [
   'supabase/schema.sql',
   'supabase/migrations/0004_feedback_submissions.sql',
   'supabase/migrations/0005_help_requests.sql',
+  'supabase/migrations/0006_admin_attempted_and_stats.sql',
+  // Twice on purpose: every migration must be idempotent (safe to re-run).
+  'supabase/migrations/0006_admin_attempted_and_stats.sql',
 ]
 for (const f of files) {
   // pgcrypto is preinstalled on Supabase; PGlite has no such extension file.
@@ -216,6 +219,22 @@ for (const [name, ok] of checks) {
 const viewRes = await db.query('select * from public.student_profiles_full order by assessment_created_at desc nulls last')
 console.log(`\nQUERY 3 (student_profiles_full): ${viewRes.rows.length} rows`)
 console.log('view columns:', viewRes.fields.map(f => f.name).join(', '))
+checks.push(['0006: assessment_attempted on the view (scored→true, attempted→true, fresh→false)',
+  viewRes.rows.find(r => r.email === 'aarti@example.com').assessment_attempted === true &&
+  viewRes.rows.find(r => r.email === 'partial@example.com').assessment_attempted === true &&
+  viewRes.rows.find(r => r.email === 'newbie@example.com').assessment_attempted === false])
+
+// --- 0006: admin_stats single-row aggregates ------------------------------
+const stats = await db.query('select * from public.admin_stats')
+console.log('\nadmin_stats:')
+console.table(stats.rows)
+checks.push(['0006: admin_stats aggregates (total 4, assessed 3, scored 2, avg 685, colleges [PCCOE])',
+  stats.rows.length === 1 &&
+  Number(stats.rows[0].total_students) === 4 &&
+  Number(stats.rows[0].assessed_students) === 3 &&
+  Number(stats.rows[0].scored_students) === 2 &&
+  Number(stats.rows[0].avg_score) === 685 &&
+  JSON.stringify([...stats.rows[0].colleges].sort()) === JSON.stringify(['PCCOE'])])
 
 // --- QUERY 5 aggregate block ---------------------------------------------
 const agg = await db.query(`

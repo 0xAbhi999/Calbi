@@ -71,7 +71,10 @@ begin
     select 1 from information_schema.columns
     where table_schema = 'public' and table_name = 'profiles' and column_name = 'prn'
   ) then
-    drop view if exists public.student_profiles_full;
+    -- Cascade: fresh projects built from supabase/schema.sql already have the
+    -- admin_stats view (migration 0006) depending on this one; cascade drops
+    -- it too and 0006 re-creates it when it runs later in the chain.
+    drop view if exists public.student_profiles_full cascade;
     create view public.student_profiles_full
     with (security_invoker = on)
     as

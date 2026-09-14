@@ -7,28 +7,34 @@
  * see every student (profile + latest assessment result + latest resume + the
  * feedback they submitted) and can:
  *   • filter by college (dropdown) and search (name/email/PRN/mobile/college)
+ *   • page through the results (50 per page) and sort by score or name
  *   • download the whole student dataset as CSV — every score, skill and
  *     personal field — or just the currently filtered view
- * The CSV is generated from the exact rows shown, and the same columns are
- * also served by GET /api/admin/export (full dataset) for big downloads.
+ * Filtering, sorting and pagination all run SERVER-side
+ * (GET /api/admin/students), so each table page costs one small SQL window
+ * instead of the full multi-MB dataset; the CSV is rendered server-side too
+ * (GET /api/admin/export) from the same filters.
  */
-import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import {
-  AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Download, Eye, EyeOff,
+  AlertCircle, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, Eye, EyeOff,
   GraduationCap, LogOut, RefreshCw, Search, ShieldCheck, Star, Trophy, UploadCloud, Users, X,
 } from 'lucide-react'
 import { Logo } from '@/components/Logo'
 import type { AdminStudentRow } from '@/lib/csv'
-import { downloadCsv, downloadFilename, rowsToCsv } from '@/lib/csv'
+import { downloadFilename } from '@/lib/csv'
 
 type AuthState = 'checking' | 'guest' | 'authed'
 type SortKey = 'score' | 'name'
 type DataSource = 'supabase' | 'local' | ''
 
-/** How often the dashboard re-fetches from the server so it stays live.
- *  Override with NEXT_PUBLIC_ADMIN_REFRESH_MS (e.g. 5000 for 5s). */
-const REFRESH_MS = Number(process.env.NEXT_PUBLIC_ADMIN_REFRESH_MS) || 15000
+/** How often the dashboard checks for new data so it stays live.
+ *  Each tick is a ~1KB fingerprint probe (`?check=1`); the full multi-MB
+ *  dataset is re-downloaded only when the fingerprint changed, so leaving the
+ *  tab open no longer burns Supabase egress. Override with
+ *  NEXT_PUBLIC_ADMIN_REFRESH_MS (e.g. 5000 for 5s). */
+const REFRESH_MS = Number(process.env.NEXT_PUBLIC_ADMIN_REFRESH_MS) || 30000
 
 const n = (v: string) => (v === '' || v === null || v === undefined ? '—' : v)
 const gradeChip = (g: string) => g === 'S' ? 'bg-emerald-100 text-emerald-700' : g === 'A' ? 'bg-indigo-100 text-indigo-700' : g === 'B' ? 'bg-violet-100 text-violet-700' : g === 'C' ? 'bg-amber-100 text-amber-700' : 'bg-rose-100 text-rose-700'
@@ -448,8 +454,100 @@ function HelpRequests() {
   )
 }
 
+interface DashboardMeta {
+  colleges: string[]
+  stats: { total: number; colleges: number; assessed: number; avg: number }
+}
+
+/** Windowed page numbers: always 1 + last, plus the neighbourhood of `page`. */
+function pageNumbers(page: number, totalPages: number): Array<number | '…'> {
+  if (totalPages <= 7) return Array.from({ length: totalPages }, (_, i) => i + 1)
+  const keep = new Set([1, 2, page - 1, page, page + 1, totalPages - 1, totalPages])
+  const out: Array<number | '…'> = []
+  for (let p = 1; p <= totalPages; p++) {
+    if (!keep.has(p)) {
+      if (out[out.length - 1] !== '…') out.push('…')
+      continue
+    }
+    out.push(p)
+  }
+  return out
+}
+
+function Pagination({
+  page, totalPages, pageSize, total, onPage, onSize,
+}: {
+  page: number
+  totalPages: number
+  pageSize: number
+  total: number
+  onPage: (p: number) => void
+  onSize: (s: number) => void
+}) {
+  if (total === 0) return null
+  const start = (page - 1) * pageSize + 1
+  const end = Math.min(page * pageSize, total)
+  const btn = 'flex h-8 min-w-8 items-center justify-center rounded-full px-2.5 text-xs font-bold transition'
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 bg-white/60 px-4 py-3 sm:px-5">
+      <div className="text-xs font-semibold text-slate-500">
+        Showing <span className="font-black text-slate-800">{start}–{end}</span> of {total}
+      </div>
+      <div className="flex items-center gap-1">
+        <button
+          onClick={() => onPage(page - 1)}
+          disabled={page <= 1}
+          aria-label="Previous page"
+          className={`${btn} text-slate-500 hover:bg-slate-100 disabled:opacity-40`}
+        >
+          <ChevronLeft className="h-4 w-4" />
+        </button>
+        {pageNumbers(page, totalPages).map((p, i) =>
+          p === '…' ? (
+            <span key={`gap-${i}`} className="px-1 text-xs font-bold text-slate-300">…</span>
+          ) : (
+            <button
+              key={p}
+              onClick={() => onPage(p)}
+              aria-current={p === page ? 'page' : undefined}
+              className={`${btn} ${p === page ? 'bg-indigo-600 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
+            >
+              {p}
+            </button>
+          ),
+        )}
+        <button
+          onClick={() => onPage(page + 1)}
+          disabled={page >= totalPages}
+          aria-label="Next page"
+          className={`${btn} text-slate-500 hover:bg-slate-100 disabled:opacity-40`}
+        >
+          <ChevronRight className="h-4 w-4" />
+        </button>
+      </div>
+      <label className="flex items-center gap-2 text-xs font-semibold text-slate-500">
+        Rows per page
+        <select
+          value={pageSize}
+          onChange={(e) => onSize(Number(e.target.value))}
+          className="field !w-auto !rounded-full !py-1.5 !text-xs"
+        >
+          {[25, 50, 100].map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
+      </label>
+    </div>
+  )
+}
+
 function AdminDashboard({ onLogout }: { onLogout: () => void }) {
+  // Current table page (server-filtered, server-sorted) + paging state.
   const [students, setStudents] = useState<AdminStudentRow[] | null>(null)
+  const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(50)
+  const [totalPages, setTotalPages] = useState(1)
+  // College dropdown values + global stat cards (separate cheap endpoint).
+  const [meta, setMeta] = useState<DashboardMeta | null>(null)
   const [loadError, setLoadError] = useState('')
   const [refreshing, setRefreshing] = useState(false)
   const [dataSource, setDataSource] = useState<DataSource>('')
@@ -461,18 +559,41 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
   const [lastUpdated, setLastUpdated] = useState<string | null>(null)
 
   const [college, setCollege] = useState('all')
+  const [qInput, setQInput] = useState('')
   const [q, setQ] = useState('')
   const [withScoreOnly, setWithScoreOnly] = useState(false)
   const [sortBy, setSortBy] = useState<SortKey>('score')
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [exported, setExported] = useState(false)
+  const [exporting, setExporting] = useState(false)
+
+  // Fingerprint of the dataset currently on screen. The auto-refresh polls the
+  // cheap `?check=1` probe and only reloads the page when this differs.
+  const fingerprintRef = useRef<string | null>(null)
+  // Mirror of the server-driven query state so stable callbacks never close
+  // over stale filters (avoids effect churn on every keystroke).
+  const queryRef = useRef({ page, pageSize, college, q, withScoreOnly, sortBy, sortDir })
+  queryRef.current = { page, pageSize, college, q, withScoreOnly, sortBy, sortDir }
+  // Meta (stats/colleges) refreshes on demand — at most every 2 minutes via
+  // the auto-poll, so unmigrated deployments don't rescan it every tick.
+  const lastMetaRef = useRef(0)
 
   const load = useCallback(async () => {
+    const cur = queryRef.current
     setRefreshing(true)
     setLoadError('')
     try {
-      const res = await fetch('/api/admin/students')
+      const params = new URLSearchParams({
+        page: String(cur.page),
+        pageSize: String(cur.pageSize),
+        sort: cur.sortBy,
+        dir: cur.sortDir,
+      })
+      if (cur.college && cur.college !== 'all') params.set('college', cur.college)
+      if (cur.q) params.set('q', cur.q)
+      if (cur.withScoreOnly) params.set('assessed', '1')
+      const res = await fetch('/api/admin/students?' + params.toString())
       if (res.status === 401) {
         onLogout()
         return
@@ -480,10 +601,14 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Failed to load students.')
       setStudents(data.students || [])
+      setTotal(typeof data.total === 'number' ? data.total : 0)
+      if (typeof data.page === 'number' && data.page !== cur.page) setPage(data.page)
+      setTotalPages(typeof data.totalPages === 'number' && data.totalPages > 0 ? data.totalPages : 1)
       setDataSource((data.source as DataSource) || '')
       setSources(data.sources || null)
       setCanSync(!!data.canSync)
       setWarning(data.warning || '')
+      if (typeof data.fingerprint === 'string') fingerprintRef.current = data.fingerprint
       setLastUpdated(data.updated_at || new Date().toISOString())
     } catch (e: any) {
       setLoadError(e?.message || 'Failed to load students.')
@@ -492,18 +617,81 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
     }
   }, [onLogout])
 
+  const loadMeta = useCallback(async () => {
+    try {
+      const res = await fetch('/api/admin/meta')
+      if (res.status === 401) {
+        onLogout()
+        return
+      }
+      if (!res.ok) return
+      const data = await res.json()
+      if (Array.isArray(data.colleges) && data.stats) {
+        setMeta({ colleges: data.colleges, stats: data.stats })
+        lastMetaRef.current = Date.now()
+      }
+    } catch {
+      // Keep the previous meta; stats are non-critical.
+    }
+  }, [onLogout])
+
+  // Cheap liveness probe: ask the server whether anything changed (~1KB) and
+  // reload the current page only when it did. A transient probe failure keeps
+  // the last good data on screen instead of flashing an error.
+  const poll = useCallback(async () => {
+    try {
+      if (fingerprintRef.current === null) {
+        await load()
+        return
+      }
+      const res = await fetch('/api/admin/students?check=1')
+      if (res.status === 401) {
+        onLogout()
+        return
+      }
+      if (!res.ok) return
+      const data = await res.json()
+      if (typeof data.fingerprint === 'string' && data.fingerprint !== fingerprintRef.current) {
+        await load()
+        if (Date.now() - lastMetaRef.current > 120000) loadMeta()
+      }
+    } catch {
+      // Keep showing last good data; the next tick retries.
+    }
+  }, [load, loadMeta, onLogout])
+
+  // Server-driven reload whenever the query changes (page 1 on mount).
   useEffect(() => {
     load()
-  }, [load])
+  }, [load, page, pageSize, college, q, withScoreOnly, sortBy, sortDir])
 
-  // Keep the dashboard live: re-fetch on an interval while the tab is visible,
+  // Meta once on mount; refreshed on manual refresh + (guarded) auto-poll.
+  useEffect(() => {
+    loadMeta()
+  }, [loadMeta])
+
+  // Debounce the search box so one server query fires per pause in typing —
+  // and jump back to page 1 together with it (batched: a single reload).
+  // Skipped when the trimmed query is unchanged (e.g. typed then erased).
+  useEffect(() => {
+    const t = setTimeout(() => {
+      const next = qInput.trim()
+      if (next !== queryRef.current.q) {
+        setPage(1)
+        setQ(next)
+      }
+    }, 400)
+    return () => clearTimeout(t)
+  }, [qInput])
+
+  // Keep the dashboard live: probe on an interval while the tab is visible,
   // and immediately on tab focus. Pauses when the tab is hidden to save calls.
   useEffect(() => {
     let timer: ReturnType<typeof setInterval> | undefined
     const start = () => {
       if (timer) return
       timer = setInterval(() => {
-        if (document.visibilityState === 'visible') load()
+        if (document.visibilityState === 'visible') poll()
       }, REFRESH_MS)
     }
     const stop = () => {
@@ -514,13 +702,13 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
     }
     const onVisibility = () => {
       if (document.visibilityState === 'visible') {
-        load()
+        poll()
         start()
       } else {
         stop()
       }
     }
-    const onFocus = () => load()
+    const onFocus = () => poll()
     document.addEventListener('visibilitychange', onVisibility)
     window.addEventListener('focus', onFocus)
     start()
@@ -529,62 +717,38 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
       document.removeEventListener('visibilitychange', onVisibility)
       window.removeEventListener('focus', onFocus)
     }
-  }, [load])
+  }, [poll])
 
-  const colleges = useMemo(() => {
-    const set = new Set<string>()
-    for (const s of students || []) if (s.college.trim()) set.add(s.college.trim())
-    return [...set].sort((a, b) => a.localeCompare(b))
-  }, [students])
-
-  const filtered = useMemo(() => {
-    const hay = (s: AdminStudentRow) => [s.name, s.email, s.prn, s.phone, s.college].join(' ').toLowerCase()
-    const needle = q.trim().toLowerCase()
-    const list = (students || []).filter(s => {
-      if (college !== 'all' && s.college.trim().toLowerCase() !== college.toLowerCase()) return false
-      if (needle && !hay(s).includes(needle)) return false
-      if (withScoreOnly && s.has_assessment !== 'Yes') return false
-      return true
-    })
-    const dir = sortDir === 'desc' ? -1 : 1
-    list.sort((a, b) => {
-      if (sortBy === 'score') {
-        const av = a.score === '' ? -1 : Number(a.score)
-        const bv = b.score === '' ? -1 : Number(b.score)
-        if (av !== bv) return (av - bv) * dir
-      } else {
-        const c = (a.name || '').localeCompare(b.name || '')
-        if (c !== 0) return c * dir
-      }
-      return (a.college || '').localeCompare(b.college || '')
-    })
-    return list
-  }, [students, college, q, withScoreOnly, sortBy, sortDir])
-
-  const stats = useMemo(() => {
-    const all = students || []
-    const assessed = all.filter(s => s.has_assessment === 'Yes')
-    const sum = assessed.reduce((acc, s) => acc + (Number(s.score) || 0), 0)
-    return {
-      total: all.length,
-      colleges: new Set(all.map(s => s.college.trim()).filter(Boolean)).size,
-      assessed: assessed.length,
-      avg: assessed.length ? Math.round(sum / assessed.length) : 0,
-      scored: all.filter(s => Number(s.score) >= 750).length,
-    }
-  }, [students])
-
-  // Where the rows on screen came from — both stores are merged server-side.
+  // Where the matching rows came from — both stores are merged server-side.
   // (`dataSource` is the fallback for an older server that only sent `source`.)
-  const liveCount = sources?.supabase ?? (dataSource === 'supabase' ? students?.length || 0 : 0)
-  const localCount = sources?.local ?? (dataSource === 'local' ? students?.length || 0 : 0)
+  const liveCount = sources?.supabase ?? (dataSource === 'supabase' ? total : 0)
+  const localCount = sources?.local ?? (dataSource === 'local' ? total : 0)
+  const colleges = meta?.colleges || []
+  const stats = meta?.stats || { total: 0, colleges: 0, assessed: 0, avg: 0 }
+  const filtersActive = college !== 'all' || q !== '' || withScoreOnly
 
   const toggleSort = (key: SortKey) => {
+    setPage(1)
     if (sortBy === key) setSortDir(d => (d === 'desc' ? 'asc' : 'desc'))
     else {
       setSortBy(key)
       setSortDir(key === 'name' ? 'asc' : 'desc')
     }
+  }
+
+  const gotoPage = (p: number) => {
+    const next = Math.min(Math.max(1, p), totalPages)
+    if (next === page) return
+    setExpandedId(null)
+    setPage(next)
+  }
+
+  const clearFilters = () => {
+    setCollege('all')
+    setQInput('')
+    setQ('')
+    setWithScoreOnly(false)
+    setPage(1)
   }
 
   /**
@@ -609,6 +773,7 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
       )
       if (data.feedbackTableMissing) setSyncMsg(m => `${m} Feedback table missing — run supabase/migrations/0004_feedback_submissions.sql.`)
       load()
+      loadMeta()
     } catch (e: any) {
       setSyncMsg(e?.message || 'Sync failed.')
     } finally {
@@ -616,12 +781,44 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
     }
   }
 
-  const handleExport = (scope: 'filtered' | 'all') => {
-    const rows = scope === 'all' ? (students || []) : filtered
-    if (!rows.length) return
-    downloadCsv(rowsToCsv(rows), downloadFilename(scope === 'all' ? 'all' : 'filtered'))
-    setExported(true)
-    setTimeout(() => setExported(false), 2500)
+  /**
+   * CSV export, rendered server-side from the same filters as the table
+   * (the browser only holds one page, so it can no longer build the CSV).
+   * Always freshly computed — never served from the page cache.
+   */
+  const handleExport = async (scope: 'filtered' | 'all') => {
+    if (exporting) return
+    if (scope === 'filtered' && total === 0) return
+    setExporting(true)
+    try {
+      const params = new URLSearchParams({ scope })
+      if (scope === 'filtered') {
+        if (college !== 'all') params.set('college', college)
+        if (q) params.set('q', q)
+        if (withScoreOnly) params.set('assessed', '1')
+      }
+      const res = await fetch('/api/admin/export?' + params.toString())
+      if (res.status === 401) {
+        onLogout()
+        return
+      }
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Export failed.')
+      const blob = await res.blob()
+      const match = (res.headers.get('Content-Disposition') || '').match(/filename="([^"]+)"/)
+      const a = document.createElement('a')
+      a.href = URL.createObjectURL(blob)
+      a.download = match?.[1] || downloadFilename(scope)
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000)
+      setExported(true)
+      setTimeout(() => setExported(false), 2500)
+    } catch (e: any) {
+      setLoadError(e?.message || 'Export failed.')
+    } finally {
+      setExporting(false)
+    }
   }
 
   const scoreSortIcon = (key: SortKey) => {
@@ -644,7 +841,7 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
           <div className="flex items-center gap-2 text-sm">
             {students && <LiveBadge lastUpdated={lastUpdated} />}
             <button
-              onClick={load}
+              onClick={() => { load(); loadMeta() }}
               disabled={refreshing}
               className="flex items-center gap-1.5 rounded-full border border-slate-200 bg-white/80 px-3.5 py-1.5 text-xs font-bold text-slate-600 transition hover:border-slate-300 disabled:opacity-50"
             >
@@ -667,11 +864,11 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
             <p className="mt-1 text-sm text-slate-500">Every student's profile, CalibiAI score, module scores and skills — filter by college and download as CSV.</p>
           </div>
           <div className="flex flex-wrap gap-2 text-xs">
-            <button onClick={() => handleExport('all')} className="btn-soft !px-4 !py-2 font-bold">
-              <Download className="mr-1.5 inline h-3.5 w-3.5" /> Download all students CSV
+            <button onClick={() => handleExport('all')} disabled={exporting} className="btn-soft !px-4 !py-2 font-bold disabled:opacity-50">
+              <Download className="mr-1.5 inline h-3.5 w-3.5" /> {exporting ? 'Preparing…' : 'Download all students CSV'}
             </button>
-            <button onClick={() => handleExport('filtered')} disabled={!filtered.length} className="btn-primary !px-4 !py-2 disabled:opacity-50">
-              <Download className="mr-1.5 inline h-3.5 w-3.5" /> Download CSV ({filtered.length})
+            <button onClick={() => handleExport('filtered')} disabled={!total || exporting} className="btn-primary !px-4 !py-2 disabled:opacity-50">
+              <Download className="mr-1.5 inline h-3.5 w-3.5" /> {exporting ? 'Preparing…' : `Download CSV (${total})`}
             </button>
           </div>
         </div>
@@ -721,17 +918,17 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
           </div>
         )}
 
-        {/* Stats */}
-        {students && (
+        {/* Stats (global — unaffected by the table filters below) */}
+        {meta && (
           <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
             <StatCard
               icon={<Users className="h-4 w-4" />}
               label="Total students"
               value={String(stats.total)}
-              sub={localCount > 0 ? `${liveCount} live · ${localCount} local` : 'Across all colleges'}
+              sub="Across all colleges"
             />
             <StatCard icon={<GraduationCap className="h-4 w-4" />} label="Colleges" value={String(stats.colleges)} sub="Distinct institutions" />
-            <StatCard icon={<ShieldCheck className="h-4 w-4" />} label="Assessed" value={String(stats.assessed)} sub="Have a CalibiAI score" />
+            <StatCard icon={<ShieldCheck className="h-4 w-4" />} label="Assessed" value={String(stats.assessed)} sub="Took the assessment" />
             <StatCard icon={<Trophy className="h-4 w-4" />} label="Average score" value={stats.assessed ? String(stats.avg) : '—'} sub="Top 10%: 900+ · Ready: 750+" />
           </div>
         )}
@@ -742,13 +939,13 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
             <div className="relative">
               <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
               <input
-                value={q}
-                onChange={(e) => setQ(e.target.value)}
+                value={qInput}
+                onChange={(e) => setQInput(e.target.value)}
                 placeholder="Search name, email, PRN, mobile, college…"
                 className="field !rounded-full !py-2.5 pl-10 pr-9 w-full sm:w-80"
               />
-              {q && (
-                <button onClick={() => setQ('')} aria-label="Clear search" className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600">
+              {qInput && (
+                <button onClick={() => { setQInput(''); setQ(''); setPage(1) }} aria-label="Clear search" className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600">
                   <X className="h-4 w-4" />
                 </button>
               )}
@@ -758,7 +955,7 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
               <select
                 id="collegeFilter"
                 value={college}
-                onChange={(e) => setCollege(e.target.value)}
+                onChange={(e) => { setCollege(e.target.value); setPage(1) }}
                 className="field !rounded-full !py-2.5 pr-8"
               >
                 <option value="all">All colleges</option>
@@ -769,13 +966,15 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
               <input
                 type="checkbox"
                 checked={withScoreOnly}
-                onChange={(e) => setWithScoreOnly(e.target.checked)}
+                onChange={(e) => { setWithScoreOnly(e.target.checked); setPage(1) }}
                 className="h-4 w-4 rounded accent-indigo-600"
               />
               Assessed only
             </label>
             <div className="ml-auto text-xs font-semibold text-slate-500">
-              Showing <span className="font-black text-slate-800">{students ? filtered.length : 0}</span> of {students ? students.length : 0} students
+              {total === 0
+                ? 'No students found'
+                : <>Showing <span className="font-black text-slate-800">{(page - 1) * pageSize + 1}–{Math.min(page * pageSize, total)}</span> of {total} students</>}
             </div>
           </div>
           {loadError && (
@@ -792,18 +991,20 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
             <RefreshCw className="mx-auto h-6 w-6 animate-spin text-indigo-500" />
             <p className="mt-3 text-sm font-bold text-slate-600">Loading students…</p>
           </div>
-        ) : students.length === 0 ? (
-          <div className="glass-card !p-10 text-center animate-fade-up">
-            <div className="text-4xl">🗂️</div>
-            <p className="mt-3 text-sm font-bold text-slate-700">No students found</p>
-            <p className="mt-1 text-xs text-slate-500">Student profiles will appear here once candidates sign up and complete onboarding.</p>
-          </div>
-        ) : filtered.length === 0 ? (
-          <div className="glass-card !p-10 text-center animate-fade-up">
-            <Search className="mx-auto h-6 w-6 text-slate-300" />
-            <p className="mt-3 text-sm font-bold text-slate-600">No students match the current filters</p>
-            <button onClick={() => { setCollege('all'); setQ(''); setWithScoreOnly(false) }} className="btn-soft mt-4 !py-2 text-xs font-bold">Clear filters</button>
-          </div>
+        ) : total === 0 ? (
+          filtersActive ? (
+            <div className="glass-card !p-10 text-center animate-fade-up">
+              <Search className="mx-auto h-6 w-6 text-slate-300" />
+              <p className="mt-3 text-sm font-bold text-slate-600">No students match the current filters</p>
+              <button onClick={clearFilters} className="btn-soft mt-4 !py-2 text-xs font-bold">Clear filters</button>
+            </div>
+          ) : (
+            <div className="glass-card !p-10 text-center animate-fade-up">
+              <div className="text-4xl">🗂️</div>
+              <p className="mt-3 text-sm font-bold text-slate-700">No students found</p>
+              <p className="mt-1 text-xs text-slate-500">Student profiles will appear here once candidates sign up and complete onboarding.</p>
+            </div>
+          )
         ) : (
           <div className="glass-card !p-0 animate-fade-up overflow-hidden">
             <div className="overflow-x-auto">
@@ -830,7 +1031,7 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.map(s => {
+                  {(students || []).map(s => {
                     const open = expandedId === s.student_id
                     const skillList = s.all_skills.split(',').map(x => x.trim()).filter(Boolean)
                     const shownSkills = skillList.slice(0, 3)
@@ -885,10 +1086,18 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                 </tbody>
               </table>
             </div>
+            <Pagination
+              page={page}
+              totalPages={totalPages}
+              pageSize={pageSize}
+              total={total}
+              onPage={gotoPage}
+              onSize={(s) => { setPageSize(s); setPage(1) }}
+            />
           </div>
         )}
 
-        {students && students.length > 0 && (
+        {students && total > 0 && (
           <p className="pb-4 text-center text-[11px] text-slate-400">
             Data includes personal information — handle responsibly. The CSV exports 52 columns: personal details, college, PRN, mobile, skills, resume, every CalibiAI module score and the candidate's own feedback.
           </p>

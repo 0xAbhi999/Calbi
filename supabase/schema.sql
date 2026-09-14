@@ -219,8 +219,9 @@ create policy "own files" on storage.objects for all using (
 -- Download view — one row per student: profile + latest resume analysis +
 -- latest assessment result. Export from the Supabase table editor
 -- (CSV / Excel / JSON) to download all data in one click.
--- (Also provided as standalone migrations: 0002_profile_avatar_and_full_view.sql
---  and 0003_profile_prn.sql, which re-creates this view with the PRN column.)
+-- (Also provided as standalone migrations: 0002_profile_avatar_and_full_view.sql,
+--  0003_profile_prn.sql, and 0006_admin_attempted_and_stats.sql which adds
+--  assessment_attempted plus the admin_stats view below.)
 -- ============================================================================
 create or replace view public.student_profiles_full
 with (security_invoker = on)   -- RLS of the underlying tables still applies
@@ -259,7 +260,14 @@ select
   a.ai_feedback           as assessment_ai_feedback,
   a.verifiable_hash,
   a.report_storage_key    as report_storage_key,
-  a.created_at            as assessment_created_at
+  a.created_at            as assessment_created_at,
+  (a.session_id is not null
+    or exists (
+      select 1 from public.assessment_sessions s
+      where s.student_id = p.id
+        and (s.status in ('submitted', 'expired') or s.submitted_at is not null)
+    )
+  )                       as assessment_attempted
 from public.profiles p
 left join lateral (
   select ra.*
@@ -275,6 +283,24 @@ left join lateral (
   order by ar.created_at desc
   limit 1
 ) a on true;
+
+-- Single-row dashboard aggregates for GET /api/admin/meta (stat cards +
+-- college dropdown in one ~200-byte row instead of a full-table scan).
+create or replace view public.admin_stats
+with (security_invoker = on)   -- RLS of the underlying tables still applies
+as
+select
+  count(*)::int                                                     as total_students,
+  count(*) filter (where v.assessment_attempted)::int               as assessed_students,
+  count(v.talent_score)::int                                        as scored_students,
+  round(avg(v.talent_score))::int                                   as avg_score,
+  coalesce(
+    array_agg(distinct btrim(v.college))
+      filter (where v.college is not null and btrim(v.college) <> ''),
+    '{}'
+  )                                                                 as colleges
+from public.student_profiles_full v
+where v.role = 'student';
 
 -- ---------------------------------------------------------------------------
 -- Feedback submissions (post-assessment candidate feedback)
