@@ -80,10 +80,17 @@ function Inner(){
   // the same profile — including the full name set on the profile page.
   // Extracted into a `refresh` so it can also run on window focus (returning
   // from the edit-profile / update-resume pages) so the score is always live.
-  const refresh = useCallback(()=>{
+  // Focus events fire far more often than data changes (alt-tab, devtools,
+  // notifications). Throttle background re-syncs to one per minute so a
+  // student idling on the dashboard doesn't re-pull their rows constantly.
+  const lastRefreshRef = useRef(0)
+  const refresh = useCallback((force = false)=>{
     // Wait until the cached account has been validated (and possibly reconciled
     // to a different live user) so we never fetch the previous account's data.
     if(!user?.id || !validated) return
+    const now = Date.now()
+    if(!force && now - lastRefreshRef.current < 60000) return
+    lastRefreshRef.current = now
     fetch('/api/user/profile?user_id='+user.id).then(r=>r.json()).then(data=>{
       if(data.profile) setProfile(data.profile)
     }).catch(()=>{})
@@ -99,7 +106,7 @@ function Inner(){
   },[user?.id, validated, setProfile, setResume, setScores])
 
   useEffect(()=>{
-    refresh()
+    refresh(true)
   },[refresh])
 
   // Re-sync when the user returns to this tab (e.g. after editing their profile

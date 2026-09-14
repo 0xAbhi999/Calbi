@@ -12,7 +12,7 @@
  * The CSV is generated from the exact rows shown, and the same columns are
  * also served by GET /api/admin/export (full dataset) for big downloads.
  */
-import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import {
   AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Download, Eye, EyeOff,
@@ -26,9 +26,12 @@ type AuthState = 'checking' | 'guest' | 'authed'
 type SortKey = 'score' | 'name'
 type DataSource = 'supabase' | 'local' | ''
 
-/** How often the dashboard re-fetches from the server so it stays live.
- *  Override with NEXT_PUBLIC_ADMIN_REFRESH_MS (e.g. 5000 for 5s). */
-const REFRESH_MS = Number(process.env.NEXT_PUBLIC_ADMIN_REFRESH_MS) || 15000
+/** How often the dashboard checks for new data so it stays live.
+ *  Each tick is a ~1KB fingerprint probe (`?check=1`); the full multi-MB
+ *  dataset is re-downloaded only when the fingerprint changed, so leaving the
+ *  tab open no longer burns Supabase egress. Override with
+ *  NEXT_PUBLIC_ADMIN_REFRESH_MS (e.g. 5000 for 5s). */
+const REFRESH_MS = Number(process.env.NEXT_PUBLIC_ADMIN_REFRESH_MS) || 30000
 
 const n = (v: string) => (v === '' || v === null || v === undefined ? '—' : v)
 const gradeChip = (g: string) => g === 'S' ? 'bg-emerald-100 text-emerald-700' : g === 'A' ? 'bg-indigo-100 text-indigo-700' : g === 'B' ? 'bg-violet-100 text-violet-700' : g === 'C' ? 'bg-amber-100 text-amber-700' : 'bg-rose-100 text-rose-700'
@@ -468,6 +471,10 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [exported, setExported] = useState(false)
 
+  // Fingerprint of the dataset currently on screen. The auto-refresh polls the
+  // cheap `?check=1` probe and only calls `load()` when this differs.
+  const fingerprintRef = useRef<string | null>(null)
+
   const load = useCallback(async () => {
     setRefreshing(true)
     setLoadError('')
@@ -484,6 +491,7 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
       setSources(data.sources || null)
       setCanSync(!!data.canSync)
       setWarning(data.warning || '')
+      if (typeof data.fingerprint === 'string') fingerprintRef.current = data.fingerprint
       setLastUpdated(data.updated_at || new Date().toISOString())
     } catch (e: any) {
       setLoadError(e?.message || 'Failed to load students.')
@@ -492,18 +500,42 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
     }
   }, [onLogout])
 
+  // Cheap liveness probe: ask the server whether anything changed (~1KB) and
+  // re-download the full dataset only when it did. A transient probe failure
+  // keeps the last good data on screen instead of flashing an error.
+  const poll = useCallback(async () => {
+    try {
+      if (fingerprintRef.current === null) {
+        await load()
+        return
+      }
+      const res = await fetch('/api/admin/students?check=1')
+      if (res.status === 401) {
+        onLogout()
+        return
+      }
+      if (!res.ok) return
+      const data = await res.json()
+      if (typeof data.fingerprint === 'string' && data.fingerprint !== fingerprintRef.current) {
+        await load()
+      }
+    } catch {
+      // Keep showing last good data; the next tick retries.
+    }
+  }, [load, onLogout])
+
   useEffect(() => {
     load()
   }, [load])
 
-  // Keep the dashboard live: re-fetch on an interval while the tab is visible,
+  // Keep the dashboard live: probe on an interval while the tab is visible,
   // and immediately on tab focus. Pauses when the tab is hidden to save calls.
   useEffect(() => {
     let timer: ReturnType<typeof setInterval> | undefined
     const start = () => {
       if (timer) return
       timer = setInterval(() => {
-        if (document.visibilityState === 'visible') load()
+        if (document.visibilityState === 'visible') poll()
       }, REFRESH_MS)
     }
     const stop = () => {
@@ -514,13 +546,13 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
     }
     const onVisibility = () => {
       if (document.visibilityState === 'visible') {
-        load()
+        poll()
         start()
       } else {
         stop()
       }
     }
-    const onFocus = () => load()
+    const onFocus = () => poll()
     document.addEventListener('visibilitychange', onVisibility)
     window.addEventListener('focus', onFocus)
     start()
@@ -529,7 +561,7 @@ function AdminDashboard({ onLogout }: { onLogout: () => void }) {
       document.removeEventListener('visibilitychange', onVisibility)
       window.removeEventListener('focus', onFocus)
     }
-  }, [load])
+  }, [poll])
 
   const colleges = useMemo(() => {
     const set = new Set<string>()

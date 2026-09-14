@@ -185,6 +185,42 @@ function fromViewRow(r: any, assessmentSession?: any): AdminStudentRow {
   })
 }
 
+/**
+ * Columns read from the `student_profiles_full` view. This is every view
+ * column EXCEPT the two heavy JSONB blobs the admin never renders
+ * (`resume_feedback` and `assessment_ai_feedback`) — skipping them shrinks
+ * each row by ~20-40% and the dashboard downloads the whole table, so every
+ * byte here is multiplied by the student count on each refresh.
+ * (`feedback_rating/message/created_at` from migration 0004 are likewise
+ * skipped — feedback is joined explicitly so the dashboard works whether or
+ * not that migration has been applied.)
+ */
+const VIEW_COLUMNS = [
+  'student_id', 'email', 'role', 'full_name', 'prn', 'phone', 'dob', 'gender',
+  'degree', 'college', 'institution_id', 'graduation_year', 'cgpa', 'skills',
+  'linkedin_url', 'github_url', 'ai_avatar', 'profile_created_at',
+  'profile_updated_at', 'resume_id', 'resume_storage_key', 'resume_score',
+  'resume_parsed', 'resume_created_at', 'assessment_session_id', 'talent_score',
+  'grade', 'percentile', 'assessment_scores', 'verifiable_hash',
+  'report_storage_key', 'assessment_created_at',
+].join(',')
+
+/**
+ * Read the export view with the narrow column list above. Deployments whose
+ * view predates a column (e.g. migration 0003's `prn` was never applied)
+ * fail that query with an unknown-column error — retry those with a wildcard
+ * so the dashboard keeps working instead of dropping to the heavier
+ * base-table join.
+ */
+async function fetchViewRows(sb: any): Promise<{ data?: any[] | null; error?: { message: string } | null }> {
+  const narrow = await sb.from('student_profiles_full').select(VIEW_COLUMNS).eq('role', 'student')
+  if (!narrow.error) return narrow
+  if (/column|does not exist/i.test(String(narrow.error.message || ''))) {
+    return sb.from('student_profiles_full').select('*').eq('role', 'student')
+  }
+  return narrow
+}
+
 /** The export view only has an assessment session id when a result exists.
  * Read sessions separately so a submitted/expired attempt with a missing or
  * delayed result is still marked as taken in the admin dashboard. */
@@ -216,8 +252,12 @@ async function fetchFromBaseTables(sb: any): Promise<{ rows: AdminStudentRow[]; 
   try {
     const [profilesQ, resumesQ, resultsQ, sessionsQ] = await Promise.all([
       sb.from('profiles').select('*').eq('role', 'student'),
-      sb.from('resume_analyses').select('*').order('created_at', { ascending: false }),
-      sb.from('assessment_results').select('*').order('created_at', { ascending: false }),
+      // Narrow selects: the row builder only needs the score + parsed skills
+      // from resumes and the scores/total/grade/percentile/hash from results.
+      // `select('*')` would also drag the full `feedback` / `ai_feedback`
+      // JSONB blobs for every historic row (not just the latest per student).
+      sb.from('resume_analyses').select('student_id,resume_score,parsed,created_at').order('created_at', { ascending: false }),
+      sb.from('assessment_results').select('student_id,scores,total,grade,percentile,verifiable_hash,created_at').order('created_at', { ascending: false }),
       sb.from('assessment_sessions')
         .select('id,student_id,status,submitted_at,created_at')
         .order('created_at', { ascending: false }),
@@ -333,11 +373,8 @@ export async function fetchAllStudents(): Promise<AdminStudentsResult> {
 
   if (sb) {
     try {
-      // 1) Prefer the flattened export view.
-      const { data, error } = await sb
-        .from('student_profiles_full')
-        .select('*')
-        .eq('role', 'student')
+      // 1) Prefer the flattened export view (narrow columns — see VIEW_COLUMNS).
+      const { data, error } = await fetchViewRows(sb)
       if (!error) {
         const sessions = await latestAssessmentSessions(sb)
         remote = (data || []).map((r: any) => {
@@ -410,4 +447,94 @@ export async function fetchAllStudents(): Promise<AdminStudentsResult> {
     canSync: !!sb && !!(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim(),
     warning: warning || undefined,
   }
+}
+
+// ---------------------------------------------------------------------------
+// Change-detection fingerprint — the egress saver behind the admin's live view.
+// ---------------------------------------------------------------------------
+
+export interface StudentsFingerprint {
+  /** Stable string: identical iff nothing the dashboard shows has changed. */
+  fingerprint: string
+  counts: { profiles: number; results: number; resumes: number; feedback: number }
+  updated_at: string
+}
+
+/** Row count via a HEAD-style query — transfers bytes, not rows. */
+async function tableCount(sb: any, table: string, roleFilter = false): Promise<number> {
+  try {
+    let q = sb.from(table).select('id', { count: 'exact', head: true })
+    if (roleFilter) q = q.eq('role', 'student')
+    const { count, error } = await q
+    if (error) return -1
+    return count ?? 0
+  } catch {
+    return -1
+  }
+}
+
+/** Newest timestamp in a table (single tiny row) — catches edits that keep counts equal. */
+async function latestStamp(sb: any, table: string, col: string): Promise<string> {
+  try {
+    const { data, error } = await sb.from(table).select(col).order(col, { ascending: false }).limit(1).maybeSingle()
+    if (error || !data) return ''
+    return String((data as any)[col] || '')
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * A ~1KB summary of everything the dashboard renders, used by
+ * `GET /api/admin/students?check=1`. The admin page polls this on its refresh
+ * interval and only re-downloads the full (multi-MB) dataset when the
+ * fingerprint differs — so an idle dashboard costs ~120 tiny requests/hour
+ * instead of ~120 full-table downloads/hour. Local-store counts are folded in
+ * too (free — no Supabase traffic) so seeded/demo edits are also detected.
+ * Never throws: degrades to a time-based fingerprint when Supabase is down.
+ */
+export async function fetchStudentsFingerprint(): Promise<StudentsFingerprint> {
+  const sb = getServerClient()
+  const parts: Record<string, string | number> = { remote: sb ? 1 : 0 }
+  const counts = { profiles: -1, results: -1, resumes: -1, feedback: -1 }
+  if (sb) {
+    try {
+      const [profiles, results, resumes, feedback, pStamp, rStamp, resStamp, fStamp] = await Promise.all([
+        tableCount(sb, 'profiles', true),
+        tableCount(sb, 'assessment_results'),
+        tableCount(sb, 'resume_analyses'),
+        tableCount(sb, 'feedback_submissions'),
+        latestStamp(sb, 'profiles', 'updated_at'),
+        latestStamp(sb, 'assessment_results', 'created_at'),
+        latestStamp(sb, 'resume_analyses', 'created_at'),
+        latestStamp(sb, 'feedback_submissions', 'created_at'),
+      ])
+      counts.profiles = profiles
+      counts.results = results
+      counts.resumes = resumes
+      counts.feedback = feedback
+      parts.profiles = profiles
+      parts.results = results
+      parts.resumes = resumes
+      parts.feedback = feedback
+      parts.pStamp = pStamp
+      parts.rStamp = rStamp
+      parts.resStamp = resStamp
+      parts.fStamp = fStamp
+    } catch {
+      // Fall through — the time bucket below still changes the fingerprint.
+    }
+  }
+  try {
+    const db = getDB()
+    parts.local_profiles = db.profiles.length
+    parts.local_results = db.assessment_results.length
+    parts.local_resumes = db.resume_analyses.length
+    parts.local_feedback = db.feedback.length
+  } catch {
+    // Local store unreadable — ignore, remote parts still identify changes.
+  }
+  if (!sb) parts.time_bucket = Math.floor(Date.now() / 60000)
+  const fingerprint = Object.keys(parts).sort().map(k => `${k}=${parts[k]}`).join('|')
+  return { fingerprint, counts, updated_at: new Date().toISOString() }
 }

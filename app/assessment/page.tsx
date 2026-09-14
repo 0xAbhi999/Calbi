@@ -790,19 +790,32 @@ function AssessmentInner() {
           : navigator.mediaDevices.getUserMedia({ audio: true })
       const stream = await withPromptGuard(acquireStream)
       const ownsStream = !proctorAudio
-      const rec = new MediaRecorder(stream)
+      // Prefer Opus-in-WebM explicitly and cap the bitrate at 32 kbps: speech
+      // stays perfectly intelligible while uploads shrink ~4x vs the browser
+      // default (~128 kbps) — a 2-minute answer drops from ~1.9MB to ~0.5MB.
+      // That is what keeps the free Supabase Storage quota (1GB) alive once
+      // hundreds of candidates record speaking answers.
+      let mime = ''
+      for (const cand of ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4']) {
+        try { if (MediaRecorder.isTypeSupported(cand)) { mime = cand; break } } catch { /* ignore */ }
+      }
+      const rec = new MediaRecorder(stream, {
+        ...(mime ? { mimeType: mime } : {}),
+        audioBitsPerSecond: 32000,
+      })
       chunksRef.current = []
       rec.ondataavailable = e => chunksRef.current.push(e.data)
       rec.onstop = async () => {
         const blob = new Blob(chunksRef.current, { type: rec.mimeType || 'audio/webm' })
         if (ownsStream) stream.getTracks().forEach(t => t.stop())
-        const meta = { name: id + '.webm', size: blob.size, type: blob.type, at: new Date().toISOString(), uploaded: false }
+        const ext = blob.type.includes('mp4') || blob.type.includes('m4a') ? 'm4a' : 'webm'
+        const meta = { name: id + '.' + ext, size: blob.size, type: blob.type, at: new Date().toISOString(), uploaded: false }
         const sb = getSupabase()
         if (sb && sid) {
           try {
             const { data: { user } } = await sb.auth.getUser()
             if (user) {
-              const up = await sb.storage.from('speaking').upload(`${user.id}/${sid}/${id}.webm`, blob, { contentType: blob.type, upsert: true })
+              const up = await sb.storage.from('speaking').upload(`${user.id}/${sid}/${id}.${ext}`, blob, { contentType: blob.type, upsert: true })
               if (!up.error) meta.uploaded = true
             }
           } catch { }
