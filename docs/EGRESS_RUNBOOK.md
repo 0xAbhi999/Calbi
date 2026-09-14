@@ -18,7 +18,8 @@ The first item is the likely direct egress offender. The write and ID issues are
 - `GET /api/admin/students?check=1` is cached and coalesced; migration 0007 adds the one-row `admin_change_probe`.
 - Admin table reads remain page-sized and select only fields used by the table/expanded row; heavy AI feedback, storage keys and tenant metadata are excluded.
 - Transient Supabase failures no longer trigger a full-table fallback. The API serves a last-good page for up to five minutes and returns `503` with `Retry-After` after that.
-- Schema/setup errors still use the fallback path, with a visible warning, so missing migrations are not silently hidden.
+- Schema/setup errors fail closed to local rows with a visible migration warning; they never trigger an unbounded base-table read. This protects the database until the missing migration is applied.
+- Legacy view revisions retry with a bounded projection (never `select=*`).
 - Candidate feedback GETs use student/email filters and a bounded result set instead of downloading global history.
 - Assessment final persistence has one server-owned write path. The duplicate browser-side writes were removed.
 - Local IDs are mapped deterministically by scope (`profile`, `session`, `result`); retries update the same row.

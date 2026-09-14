@@ -84,8 +84,8 @@ smaller). For the long term, move audio out of Supabase — see §5.
 | 1 | Check-then-fetch admin polling: `GET /api/admin/students?check=1` returns a ~1 KB fingerprint (counts + latest timestamps); full dataset only on change | `app/admin/page.tsx`, `app/api/admin/students/route.ts`, `lib/adminStudents.ts` (`fetchStudentsFingerprint`) | ~99% of admin egress when idle |
 | 2 | Default refresh 15 s → 30 s (still overridable via `NEXT_PUBLIC_ADMIN_REFRESH_MS`) | `app/admin/page.tsx`, `.env.example` | 2× fewer polls |
 | 3 | 20 s server-side cache on the full admin payload (collapses concurrent tabs/admins into one Supabase read) | `app/api/admin/students/route.ts` | Nx fewer upstream reads |
-| 4 | Narrow view columns: skip unused `resume_feedback` + `assessment_ai_feedback` JSONB (with wildcard retry for old view revisions) | `lib/adminStudents.ts` (`VIEW_COLUMNS`) | ~20–40% smaller full payload |
-| 5 | Narrow base-table fallback selects (skip `feedback`/`ai_feedback` blobs on *historic* rows) | `lib/adminStudents.ts` | Same, fallback path |
+| 4 | Narrow view columns: skip unused `resume_feedback` + `assessment_ai_feedback` JSONB; legacy revisions retry with another bounded projection, never `select=*` | `lib/adminStudents.ts` (`VIEW_COLUMNS`) | ~20–40% smaller full payload |
+| 5 | Missing-view/schema failures fail closed to local rows instead of downloading all base-table history | `lib/adminStudents.ts` | Prevents outage-amplifying fallback reads |
 | 6 | Student dashboard focus re-sync throttled to 1/minute | `app/dashboard/student/page.tsx` | Idle-tab reads |
 | 7 | Speaking recordings: 32 kbps Opus + correct extension | `app/assessment/page.tsx` | ~4× smaller audio |
 

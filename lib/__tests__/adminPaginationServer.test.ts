@@ -19,7 +19,7 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 
-import { fetchAdminMeta, fetchStudentsPage } from '../adminStudents.ts'
+import { fetchAdminMeta, fetchStudentsFingerprint, fetchStudentsPage } from '../adminStudents.ts'
 import { parsePageParams } from '../adminPage.ts'
 import { flushDB, saveAssessmentResult, saveFeedback, saveProfile, setDbDirectory } from '../db.ts'
 
@@ -274,13 +274,14 @@ const viewRequests = () => requested.filter(u => u.includes('GET student_profile
 
 // ------------------------------------------------------------------- tests
 
-test('ancient view: narrow select fails once, then wide retry succeeds', async () => {
+test('ancient view: narrow select fails once, then bounded legacy projection succeeds', async () => {
   mode.narrowFails = true
   requested.length = 0
   const page = await fetchStudentsPage(parsePageParams({ page: '1', pageSize: '50' }))
   assert.equal(page.total, 11)
   assert.equal(viewRequests().length, 2)
-  assert.ok(viewRequests()[1].includes('select=*'), 'wide retry uses select=*')
+  assert.ok(!viewRequests()[1].includes('select=*'), 'legacy retry never uses select=*')
+  assert.ok(!viewRequests()[1].includes('prn'), 'legacy retry omits the unavailable column')
   mode.narrowFails = false
 })
 
@@ -393,17 +394,30 @@ test('meta: single-row stats view + local merge', async () => {
   assert.deepEqual(meta.stats, { total: 11, colleges: 2, assessed: 10, avg: 801 })
 })
 
-test('meta: falls back to a narrow scan without migration 0006', async () => {
+test('meta: falls back to a bounded scan without migration 0006', async () => {
   mode.stats = 'missing'
   requested.length = 0
   try {
     const meta = await fetchAdminMeta()
     const scan = requested.find(u => u.includes('GET student_profiles_full'))
-    assert.ok(scan && scan.includes('select=talent_score'), `narrow scan used: ${scan}`)
+    assert.ok(scan && scan.includes('select=talent_score'), `bounded scan used: ${scan}`)
+    assert.ok(scan && scan.includes('limit=100'), `scan is capped: ${scan}`)
     assert.deepEqual(meta.stats, { total: 11, colleges: 2, assessed: 9, avg: 801 })
   } finally {
     mode.stats = 'missing'
   }
+})
+
+test('missing compact probe never revives the old eight-query polling path', async () => {
+  requested.length = 0
+  const first = await fetchStudentsFingerprint()
+  const afterFirst = requested.length
+  const second = await fetchStudentsFingerprint()
+  assert.equal(afterFirst, 1, `only the compact probe should be queried: ${requested.join(' | ')}`)
+  assert.equal(requested.length, afterFirst, 'the short fingerprint cache should coalesce the next poll')
+  assert.equal(second.fingerprint, first.fingerprint)
+  assert.ok(requested[0].includes('admin_change_probe'))
+  assert.ok(!requested.some(u => /profiles|assessment_results|resume_analyses|feedback_submissions/.test(u)))
 })
 
 test('missing view: degraded fallback still shows local rows with a warning', async () => {

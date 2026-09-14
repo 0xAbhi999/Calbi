@@ -24,6 +24,19 @@ export interface AuthResult {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
+// Explicit projections keep the dashboard/auth reconciliation path bounded even
+// when a profile or assessment row gains a large JSON/text column later.
+export const PROFILE_SELECT = [
+  'id', 'email', 'role', 'full_name', 'prn', 'phone', 'dob', 'gender', 'degree',
+  'college', 'institution_id', 'graduation_year', 'cgpa', 'skills',
+  'linkedin_url', 'github_url', 'ai_avatar', 'created_at', 'updated_at',
+].join(',')
+
+export const ASSESSMENT_RESULT_SELECT = [
+  'id', 'session_id', 'student_id', 'scores', 'total', 'grade', 'percentile',
+  'verifiable_hash', 'ai_feedback', 'report_storage_key', 'created_at',
+].join(',')
+
 function clean(v: any): string | null {
   const s = String(v ?? '').trim()
   return s ? s : null
@@ -148,7 +161,7 @@ export async function fetchProfile(client: SupabaseClient, userId: string): Prom
   try {
     const { data } = await client
       .from('profiles')
-      .select('*')
+      .select(PROFILE_SELECT)
       .eq('id', userId)
       .maybeSingle()
     return data || null
@@ -551,7 +564,7 @@ export async function fetchLatestAssessmentResult(client: SupabaseClient, studen
   try {
     const { data } = await client
       .from('assessment_results')
-      .select('*')
+      .select(ASSESSMENT_RESULT_SELECT)
       .eq('student_id', studentId)
       .order('created_at', { ascending: false })
       .limit(1)
