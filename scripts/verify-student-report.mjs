@@ -54,14 +54,26 @@ await db.exec(`
 
 // --- the real schema + every migration, in order --------------------------
 // Fresh-project path (what the README documents for a new Supabase project):
-// schema.sql already contains 0002/0003, then the two feedback/help migrations.
+// schema.sql is the complete, latest-shape script. The numbered migrations
+// must ALSO apply cleanly on top of it, in any re-run order: CREATE OR REPLACE
+// VIEW cannot remove or reorder columns (Postgres 42P16 "cannot drop columns
+// from view"), so each view-changing migration is regression-tested here.
 const files = [
   'supabase/schema.sql',
+  'supabase/migrations/0002_profile_avatar_and_full_view.sql',
+  'supabase/migrations/0003_profile_prn.sql',
   'supabase/migrations/0004_feedback_submissions.sql',
   'supabase/migrations/0005_help_requests.sql',
   'supabase/migrations/0006_admin_attempted_and_stats.sql',
-  // Twice on purpose: every migration must be idempotent (safe to re-run).
+  'supabase/migrations/0007_egress_query_hardening.sql',
+  // Idempotency: every migration must be safe to re-run, and re-running
+  // schema.sql AFTER the migrations used to fail with 42P16 because the view
+  // had gained feedback_* columns it did not know about.
   'supabase/migrations/0006_admin_attempted_and_stats.sql',
+  'supabase/migrations/0007_egress_query_hardening.sql',
+  'supabase/schema.sql',
+  'supabase/migrations/0006_admin_attempted_and_stats.sql',
+  'supabase/migrations/0007_egress_query_hardening.sql',
 ]
 for (const f of files) {
   // pgcrypto is preinstalled on Supabase; PGlite has no such extension file.
@@ -276,6 +288,28 @@ await db.exec(`create view public.student_reports_full with (security_invoker = 
 const viewBack = await db.query('select name, calibiai_score, feedback_rating, help_requests from public.student_reports_full order by calibiai_score desc nulls last')
 console.log('\nQUERY 4 (installed as a view):')
 console.table(viewBack.rows)
+
+// Whatever order the schema/migration files ran in, the export view must end
+// in its canonical latest shape and all three views must still be present
+// (guards the 42P16 "cannot drop columns from view" class of regression).
+{
+  const { rows } = await db.query(`
+    select array_agg(column_name order by ordinal_position)::text[] as cols
+    from information_schema.columns
+    where table_schema = 'public' and table_name = 'student_profiles_full'`)
+  const cols = rows[0].cols
+  for (const c of ['prn', 'assessment_attempted', 'feedback_rating', 'feedback_message', 'feedback_created_at']) {
+    checks.push([`student_profiles_full has ${c} after every re-run`, cols.includes(c)])
+  }
+  const views = await db.query(`
+    select table_name from information_schema.views
+    where table_schema = 'public'
+      and table_name in ('student_profiles_full', 'admin_stats', 'admin_change_probe')`)
+  const names = views.rows.map(r => r.table_name)
+  for (const v of ['student_profiles_full', 'admin_stats', 'admin_change_probe']) {
+    checks.push([`view ${v} present after every re-run`, names.includes(v)])
+  }
+}
 
 for (const [name, ok] of checks.slice(9)) {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}`)
