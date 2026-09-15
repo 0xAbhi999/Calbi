@@ -223,92 +223,6 @@ create policy "own files" on storage.objects for all using (
   and (storage.foldername(name))[1] = auth.uid()::text
 );
 
--- ============================================================================
--- Download view — one row per student: profile + latest resume analysis +
--- latest assessment result. Export from the Supabase table editor
--- (CSV / Excel / JSON) to download all data in one click.
--- (Also provided as standalone migrations: 0002_profile_avatar_and_full_view.sql,
---  0003_profile_prn.sql, and 0006_admin_attempted_and_stats.sql which adds
---  assessment_attempted plus the admin_stats view below.)
--- ============================================================================
-create or replace view public.student_profiles_full
-with (security_invoker = on)   -- RLS of the underlying tables still applies
-as
-select
-  p.id                    as student_id,
-  p.email,
-  p.role,
-  p.full_name,
-  p.prn,
-  p.phone,
-  p.dob,
-  p.gender,
-  p.degree,
-  p.college,
-  p.institution_id,
-  p.graduation_year,
-  p.cgpa,
-  p.skills,
-  p.linkedin_url,
-  p.github_url,
-  p.ai_avatar,
-  p.created_at            as profile_created_at,
-  p.updated_at            as profile_updated_at,
-  r.id                    as resume_id,
-  r.storage_key           as resume_storage_key,
-  r.resume_score,
-  r.parsed                as resume_parsed,
-  r.feedback              as resume_feedback,
-  r.created_at            as resume_created_at,
-  a.session_id            as assessment_session_id,
-  a.total                 as talent_score,
-  a.grade,
-  a.percentile,
-  a.scores                as assessment_scores,
-  a.ai_feedback           as assessment_ai_feedback,
-  a.verifiable_hash,
-  a.report_storage_key    as report_storage_key,
-  a.created_at            as assessment_created_at,
-  (a.session_id is not null
-    or exists (
-      select 1 from public.assessment_sessions s
-      where s.student_id = p.id
-        and (s.status in ('submitted', 'expired') or s.submitted_at is not null)
-    )
-  )                       as assessment_attempted
-from public.profiles p
-left join lateral (
-  select ra.*
-  from public.resume_analyses ra
-  where ra.student_id = p.id
-  order by ra.created_at desc
-  limit 1
-) r on true
-left join lateral (
-  select ar.*
-  from public.assessment_results ar
-  where ar.student_id = p.id
-  order by ar.created_at desc
-  limit 1
-) a on true;
-
--- Single-row dashboard aggregates for GET /api/admin/meta (stat cards +
--- college dropdown in one ~200-byte row instead of a full-table scan).
-create or replace view public.admin_stats
-with (security_invoker = on)   -- RLS of the underlying tables still applies
-as
-select
-  count(*)::int                                                     as total_students,
-  count(*) filter (where v.assessment_attempted)::int               as assessed_students,
-  count(v.talent_score)::int                                        as scored_students,
-  round(avg(v.talent_score))::int                                   as avg_score,
-  coalesce(
-    array_agg(distinct btrim(v.college))
-      filter (where v.college is not null and btrim(v.college) <> ''),
-    '{}'
-  )                                                                 as colleges
-from public.student_profiles_full v
-where v.role = 'student';
 
 -- ---------------------------------------------------------------------------
 -- Feedback submissions (post-assessment candidate feedback)
@@ -389,6 +303,116 @@ create policy help_requests_insert_any on public.help_requests
 drop policy if exists help_requests_select_own on public.help_requests;
 create policy help_requests_select_own on public.help_requests
   for select using (student_id = auth.uid());
+
+-- ============================================================================
+-- Download view — one row per student: profile + latest resume analysis +
+-- latest assessment result + latest feedback. Export from the Supabase table
+-- editor (CSV / Excel / JSON) to download all data in one click.
+--
+-- Defined AFTER every table it joins (incl. feedback_submissions) and dropped
+-- + re-created rather than CREATE OR REPLACE'd: PostgreSQL's CREATE OR REPLACE
+-- VIEW cannot remove or reorder columns (ERROR 42P16 "cannot drop columns
+-- from view"), and this view's shape has changed across migrations (0002 adds
+-- ai_avatar, 0003 inserts prn mid-list, 0004 appends feedback_*, 0006 appends
+-- assessment_attempted). Drop the dependent admin_stats first.
+-- ============================================================================
+drop view if exists public.admin_stats;
+drop view if exists public.student_profiles_full;
+
+create view public.student_profiles_full
+with (security_invoker = on)   -- RLS of the underlying tables still applies
+as
+select
+  p.id                    as student_id,
+  p.email,
+  p.role,
+  p.full_name,
+  p.prn,
+  p.phone,
+  p.dob,
+  p.gender,
+  p.degree,
+  p.college,
+  p.institution_id,
+  p.graduation_year,
+  p.cgpa,
+  p.skills,
+  p.linkedin_url,
+  p.github_url,
+  p.ai_avatar,
+  p.created_at            as profile_created_at,
+  p.updated_at            as profile_updated_at,
+  r.id                    as resume_id,
+  r.storage_key           as resume_storage_key,
+  r.resume_score,
+  r.parsed                as resume_parsed,
+  r.feedback              as resume_feedback,
+  r.created_at            as resume_created_at,
+  a.session_id            as assessment_session_id,
+  a.total                 as talent_score,
+  a.grade,
+  a.percentile,
+  a.scores                as assessment_scores,
+  a.ai_feedback           as assessment_ai_feedback,
+  a.verifiable_hash,
+  a.report_storage_key    as report_storage_key,
+  a.created_at            as assessment_created_at,
+  (a.session_id is not null
+    or exists (
+      select 1 from public.assessment_sessions s
+      where s.student_id = p.id
+        and (s.status in ('submitted', 'expired') or s.submitted_at is not null)
+    )
+  )                       as assessment_attempted,
+  f.rating                as feedback_rating,
+  f.message               as feedback_message,
+  f.created_at            as feedback_created_at
+from public.profiles p
+left join lateral (
+  select ra.*
+  from public.resume_analyses ra
+  where ra.student_id = p.id
+  order by ra.created_at desc
+  limit 1
+) r on true
+left join lateral (
+  select ar.*
+  from public.assessment_results ar
+  where ar.student_id = p.id
+  order by ar.created_at desc
+  limit 1
+) a on true
+left join lateral (
+  select fs.rating, fs.message, fs.created_at
+  from public.feedback_submissions fs
+  where fs.student_id = p.id or lower(fs.email) = lower(p.email)
+  order by fs.created_at desc
+  limit 1
+) f on true;
+
+comment on view public.student_profiles_full is
+  'One row per student: profile + latest resume analysis + latest assessment result + latest feedback. assessment_attempted is true with a result or a submitted/expired session. Used by the /admin dashboard and CSV export.';
+
+-- Single-row dashboard aggregates for GET /api/admin/meta (stat cards +
+-- college dropdown in one ~200-byte row instead of a full-table scan).
+create view public.admin_stats
+with (security_invoker = on)   -- RLS of the underlying tables still applies
+as
+select
+  count(*)::int                                                     as total_students,
+  count(*) filter (where v.assessment_attempted)::int               as assessed_students,
+  count(v.talent_score)::int                                        as scored_students,
+  round(avg(v.talent_score))::int                                   as avg_score,
+  coalesce(
+    array_agg(distinct btrim(v.college))
+      filter (where v.college is not null and btrim(v.college) <> ''),
+    '{}'
+  )                                                                 as colleges
+from public.student_profiles_full v
+where v.role = 'student';
+
+comment on view public.admin_stats is
+  'Single-row aggregates for the /admin stat cards and college dropdown (total / assessed / scored / average score / distinct colleges). Read by GET /api/admin/meta.';
 
 -- ---------------------------------------------------------------------------
 -- Low-egress admin change probe (migration 0007)

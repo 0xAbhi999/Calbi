@@ -9,7 +9,10 @@
 --
 -- The `student_profiles_full` export view is re-created (not replaced) because
 -- the new column sits in the middle of its column list, which
--- `create or replace view` refuses to do. Nothing depends on the view.
+-- `create or replace view` refuses to do (42P16: cannot drop columns from
+-- view). The drop cascades: projects built from supabase/schema.sql, or a
+-- re-run of this chain after 0006, already have the `admin_stats` view
+-- depending on this one; migration 0006 re-creates `admin_stats` afterwards.
 -- ============================================================================
 
 alter table public.profiles
@@ -26,7 +29,7 @@ create unique index if not exists profiles_prn_unique_idx
 -- ---------------------------------------------------------------------------
 -- Re-create the download view with the PRN column included.
 -- ---------------------------------------------------------------------------
-drop view if exists public.student_profiles_full;
+drop view if exists public.student_profiles_full cascade;
 
 create view public.student_profiles_full
 with (security_invoker = on)   -- RLS of the underlying tables still applies
