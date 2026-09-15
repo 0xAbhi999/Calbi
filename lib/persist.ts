@@ -128,8 +128,34 @@ export async function supabaseSignIn(
 
 /** Mirrors the full onboarding form (mobile, gender, degree, …) into public.profiles. */
 export async function persistProfile(client: SupabaseClient, p: any): Promise<boolean> {
+  return (await persistProfileDetailed(client, p)).ok
+}
+
+/**
+ * Same write, but it reports WHY it failed.
+ *
+ * The boolean wrapper above made a rejected write indistinguishable from
+ * success at the route level: the student saw "Saved", `supabase: false` was
+ * ignored, and Postgres kept only the name/email the sign-up trigger seeded.
+ * The usual reason is RLS — `profiles` is `auth.uid() = id`, so a server client
+ * without the caller's JWT (anon key, no SUPABASE_SERVICE_ROLE_KEY) is rejected
+ * with `42501`. Use `getClientForRequest(req)` in the route to avoid it.
+ */
+export async function persistProfileDetailed(client: SupabaseClient, p: any): Promise<PersistOutcome> {
+  const id = String(p.id || p.user_id || '').trim()
+  // `profiles.id` is a uuid PK that references auth.users(id): a local demo id
+  // ("u_1a2b3c4d") can never be stored, so say so instead of letting Postgres
+  // answer 22P02 and looking like a random database failure.
+  if (!UUID_RE.test(id)) {
+    return {
+      ok: false,
+      code: '22P02',
+      message: `Profile id "${id || '(missing)'}" is not a Supabase auth UUID, so it cannot be stored in profiles.`,
+      notUuid: true,
+    }
+  }
   const row = {
-    id: p.id || p.user_id,
+    id,
     email: clean(p.email),
     full_name: clean(p.full_name),
     prn: clean(p.prn),
@@ -151,9 +177,9 @@ export async function persistProfile(client: SupabaseClient, p: any): Promise<bo
     .upsert(row, { onConflict: 'id' })
   if (error) {
     console.warn('[supabase] profile persist failed:', error.message)
-    return false
+    return outcomeOf(error)
   }
-  return true
+  return { ok: true }
 }
 
 /** Latest profile row for a user (used by login to route returners correctly). */
@@ -171,6 +197,11 @@ export async function fetchProfile(client: SupabaseClient, userId: string): Prom
 }
 
 export async function persistResumeAnalysis(client: SupabaseClient, rec: any): Promise<boolean> {
+  return (await persistResumeAnalysisDetailed(client, rec)).ok
+}
+
+/** Same write, reporting WHY it failed (see `persistProfileDetailed`). */
+export async function persistResumeAnalysisDetailed(client: SupabaseClient, rec: any): Promise<PersistOutcome> {
   const { error } = await client.from('resume_analyses').insert({
     student_id: rec.student_id,
     storage_key: rec.storage_key || null,
@@ -193,9 +224,9 @@ export async function persistResumeAnalysis(client: SupabaseClient, rec: any): P
   })
   if (error) {
     console.warn('[supabase] resume persist failed:', error.message)
-    return false
+    return outcomeOf(error)
   }
-  return true
+  return { ok: true }
 }
 
 /** What happened when a row was written to Postgres (or why it was not). */
@@ -210,11 +241,16 @@ export interface PersistOutcome {
   tableMissing?: boolean
   /** `student_id` had to be dropped because the referenced profile is missing. */
   detachedFromProfile?: boolean
+  /** Row-level security rejected the write (42501) — the caller's JWT is missing. */
+  rls?: boolean
+  /** The id is not a UUID, so Postgres could never store the row. */
+  notUuid?: boolean
 }
 
 const DUPLICATE_KEY = '23505'
 const FK_VIOLATION = '23503'
 const UNDEFINED_TABLE = '42P01'
+const RLS_VIOLATION = '42501'
 
 function outcomeOf(error: any): PersistOutcome {
   const code = String(error?.code ?? '').trim() || undefined
@@ -223,7 +259,31 @@ function outcomeOf(error: any): PersistOutcome {
     code,
     message: String(error?.message ?? error ?? 'Unknown database error'),
     tableMissing: code === UNDEFINED_TABLE,
+    rls: code === RLS_VIOLATION,
   }
+}
+
+/**
+ * One-line explanation for the UI when a Supabase write did not land.
+ *
+ * The data is never lost — the local store still has it — but the student (and
+ * whoever supports them) must be able to see that Postgres is out of sync
+ * instead of assuming the save worked. Returns null when the write succeeded or
+ * Supabase is not configured.
+ */
+export function syncWarning(outcome?: PersistOutcome | null): string | null {
+  if (!outcome || outcome.ok) return null
+  if (outcome.rls) {
+    return 'Saved on this device, but Supabase rejected the write (row-level security). ' +
+      'Set SUPABASE_SERVICE_ROLE_KEY on the server, or make sure you are signed in so the request carries your access token.'
+  }
+  if (outcome.tableMissing) {
+    return 'Saved on this device — the Supabase table is missing. Run supabase/schema.sql (or the migrations) in the Supabase SQL editor.'
+  }
+  if (outcome.notUuid) {
+    return 'Saved on this device — this account is a local demo id, not a Supabase user, so it cannot be mirrored to Postgres.'
+  }
+  return `Saved on this device, but the Supabase write failed (${outcome.code || 'error'}): ${outcome.message || 'unknown error'}`
 }
 
 /**
@@ -426,10 +486,24 @@ export async function fetchFeedbackForStudent(
 }
 
 export async function persistTrackingEvent(client: SupabaseClient, ev: any): Promise<boolean> {
+  return (await persistTrackingEventDetailed(client, ev)).ok
+}
+
+/** Same write, reporting WHY it failed (see `persistProfileDetailed`). */
+export async function persistTrackingEventDetailed(client: SupabaseClient, ev: any): Promise<PersistOutcome> {
+  const userId = String(ev.user_id || '').trim()
+  if (!UUID_RE.test(userId)) {
+    return {
+      ok: false,
+      code: '22P02',
+      message: `Tracking user_id "${userId || '(missing)'}" is not a Supabase auth UUID, so it cannot be stored in tracking_events.`,
+      notUuid: true,
+    }
+  }
   const { error } = await client.from('tracking_events').upsert(
     {
       id: ev.id,
-      user_id: ev.user_id,
+      user_id: userId,
       action: ev.action || '',
       completed: !!ev.completed,
       completed_at: ev.completed ? (ev.completed_at || new Date().toISOString()) : null,
@@ -438,9 +512,9 @@ export async function persistTrackingEvent(client: SupabaseClient, ev: any): Pro
   )
   if (error) {
     console.warn('[supabase] tracking persist failed:', error.message)
-    return false
+    return outcomeOf(error)
   }
-  return true
+  return { ok: true }
 }
 
 /** Closes any active session for the student (before creating a new one). */

@@ -54,10 +54,31 @@ Copy `.env.example` → `.env.local`:
 | Variable | Purpose |
 |---|---|
 | `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase Auth + Postgres (sessions, profiles, results) + Storage (resumes, speaking audio). Run `supabase/schema.sql` in the Supabase SQL editor first. |
-| `SUPABASE_SERVICE_ROLE_KEY` | Optional, server-side only. Lets the API routes create confirmed users and mirror onboarding (mobile, gender, degree…), resume analyses and tracking events into Postgres bypassing RLS. Never expose it client-side. |
+| `SUPABASE_SERVICE_ROLE_KEY` | Optional, server-side only. Lets the API routes create confirmed users and bypasses RLS for the admin dashboard / seed job. **Not** needed for a student's own profile, resume, tracking, session and result writes — those go out with the student's access token (see below). Never expose it client-side. |
 | `CALIBIAI_API_KEY` | CalibiAI AI grading of writing / speaking transcript / debugging / feature / prompts. **Server-side only** (`/api/ai/evaluate`); falls back to a rule engine when absent. |
 
 When Supabase is configured: email + password live in **Supabase Auth** (`auth.users`), a `profiles` row is auto-created on sign-up and every onboarding field (mobile number, PRN, gender, degree, college, CGPA, skills, links), resume analysis and WhatsApp/LinkedIn tracking event is mirrored to Postgres by the API routes (service-role writes when `SUPABASE_SERVICE_ROLE_KEY` is set). The browser session is handed to supabase-js after login so RLS and Storage uploads work client-side. **Each student gets their own isolated assessment session** (server-side row, one active session per student, RLS-protected), answers + results persist to Postgres and recordings/resumes go to Storage buckets. When the CalibiAI grader is configured, every subjective section shows an "✨ Evaluate with AI" button that returns a rubric score, strengths and improvement notes (otherwise a deterministic heuristic runs).
+
+### "The student saved, but nothing appears in Supabase"
+
+Every student-owned table is protected by `auth.uid() = id`. A server-side client built from the **anon key has no session**, so in Postgres `auth.uid()` is `NULL` and the write is refused with `42501 new row violates row-level security policy`. The sign-up trigger still creates the `profiles` row (id, email, name), so the student looks signed up while phone / PRN / gender / degree / college never arrive — and reads fail the same way, which is why login used to report `has_onboarding: false` for everyone.
+
+Two ways to write, both supported:
+
+1. **The student's own access token (default, no extra key).** `lib/apiFetch.ts` puts `Authorization: Bearer <access_token>` on every `/api/*` call, and `getClientForRequest(req)` (`lib/supabaseServer.ts`) hands that token to supabase-js so PostgREST sees the real user and RLS passes. This is what the app does out of the box once someone is signed in.
+2. **`SUPABASE_SERVICE_ROLE_KEY`** — bypasses RLS entirely. Needed for the admin dashboard (reading *every* student), `npm run seed:supabase` and sign-up (which creates the auth account before a token exists).
+
+A write that does not land is no longer silent: the route answers `{ saved: true, supabase: false, sync_warning: "…row-level security…" }` and the candidate sees an amber banner on the dashboard/profile/onboarding pages (`components/SyncWarningBanner.tsx`) instead of a plain "Saved".
+
+To check the policies themselves without a Supabase project:
+
+```bash
+npm run verify:rls    # builds supabase/schema.sql in PGlite and replays the real writes
+```
+
+It asserts that an anonymous write is rejected, the same write with the student's token lands (phone/college/gender), another student still cannot overwrite it, and `service_role` bypasses RLS.
+
+Also make sure the project actually has the schema, not just the tables: `profiles.id` is a `uuid` PK that references `auth.users(id)`, and the `on_auth_user_created` trigger in `supabase/schema.sql` is what creates the row at sign-up. If you created the tables by hand from the table editor, re-run `supabase/schema.sql` in the SQL editor (it is idempotent).
 
 ### Google sign-in & custom domains
 

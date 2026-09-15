@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getLatestAssessmentResultForStudent } from '@/lib/db'
-import { getServerClient } from '@/lib/supabaseServer'
+import { getClientForRequest } from '@/lib/supabaseServer'
 import { fetchLatestAssessmentResult } from '@/lib/persist'
 
 export async function GET(req: Request) {
@@ -10,7 +10,7 @@ export async function GET(req: Request) {
     if (!studentId) return NextResponse.json({ error: 'Missing student_id' }, { status: 400 })
     // The local JSON store is per-instance (lost on serverless restarts); when
     // Supabase is configured, Postgres is the source of truth for results.
-    const sb = getServerClient()
+    const sb = getClientForRequest(req)
     if (sb) {
       const result = await fetchLatestAssessmentResult(sb, studentId)
       if (result) return NextResponse.json({ result, supabase: true })

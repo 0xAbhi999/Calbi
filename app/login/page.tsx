@@ -9,6 +9,7 @@ import { Logo } from '@/components/Logo'
 import { afterSignInRoute, signedInLandingRoute } from '@/lib/nextStep'
 import { isProfileComplete } from '@/lib/validate'
 import { getLiveUser } from '@/lib/session'
+import { authFetch } from '@/lib/apiFetch'
 
 function GoogleIcon({ className = 'h-5 w-5' }: { className?: string }) {
   return (
@@ -145,9 +146,21 @@ export default function LoginPage() {
         setResume(null)
       }
 
+      // Hand the session to supabase-js BEFORE the profile prefetch: the
+      // profile read is RLS-scoped to `auth.uid() = id`, and lib/apiFetch.ts can
+      // only forward the access token once the session exists locally.
+      try {
+        const sb = getSupabase()
+        if (sb && data.access_token && data.refresh_token) {
+          await sb.auth.setSession({ access_token: data.access_token, refresh_token: data.refresh_token })
+        }
+      } catch {
+        /* demo mode */
+      }
+
       if (authUser.id && data.has_onboarding) {
         try {
-          const pr = await fetch('/api/user/profile?user_id=' + authUser.id).then((r) => r.json())
+          const pr = await authFetch('/api/user/profile?user_id=' + authUser.id).then((r) => r.json())
           if (pr?.profile?.full_name?.trim()) {
             resolvedName = pr.profile.full_name.trim()
             setProfile(pr.profile)
@@ -172,15 +185,6 @@ export default function LoginPage() {
         institution_id: authUser.institution_id || 'inst_iitm',
         name: resolvedName,
       })
-
-      try {
-        const sb = getSupabase()
-        if (sb && data.access_token && data.refresh_token) {
-          await sb.auth.setSession({ access_token: data.access_token, refresh_token: data.refresh_token })
-        }
-      } catch {
-        /* demo mode */
-      }
 
       router.replace(dest)
     } catch (e: any) {

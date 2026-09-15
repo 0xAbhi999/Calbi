@@ -67,3 +67,23 @@ export function getSupabase(): SupabaseClient | null {
   }
   return client
 }
+
+/**
+ * The signed-in user's access token, or null in demo mode / when signed out.
+ *
+ * Every API route that writes to a student's own Postgres rows needs this: the
+ * RLS policies are `auth.uid() = id`, and the server-side client is only able
+ * to satisfy them when the caller's JWT is forwarded (see lib/supabaseServer.ts).
+ * Without it the write is rejected and the student's data never reaches
+ * Supabase. `getSession()` also transparently refreshes an expired token.
+ */
+export async function getAccessToken(): Promise<string | null> {
+  const sb = getSupabase()
+  if (!sb) return null
+  try {
+    const { data } = await sb.auth.getSession()
+    return data?.session?.access_token || null
+  } catch {
+    return null
+  }
+}

@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto'
 import { NextResponse } from 'next/server'
 import { saveAssessmentResult, saveAssessmentSession, getAssessmentSession, flushDB, type AssessmentSession } from '@/lib/db'
-import { getServerClient } from '@/lib/supabaseServer'
+import { getClientForRequest } from '@/lib/supabaseServer'
 import { persistAssessmentResult, persistAssessmentSession, toUuid } from '@/lib/persist'
 
 export async function POST(req: Request) {
@@ -59,7 +59,7 @@ export async function POST(req: Request) {
     // Mirror to Supabase: session status first (FK for the result row), then
     // the result — this is what makes the score survive a re-login.
     let supabase = false
-    const sb = getServerClient()
+    const sb = getClientForRequest(req)
     if (sb) {
       const sessionOk = await persistAssessmentSession(sb, { ...s, ...body, answers: body.answers || s.answers })
       supabase = await persistAssessmentResult(sb, result)

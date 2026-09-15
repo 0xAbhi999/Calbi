@@ -6,6 +6,7 @@ import { OnboardingFlow } from '@/components/OnboardingFlow'
 import { isProfileComplete } from '@/lib/validate'
 import { DASHBOARD_ROUTE } from '@/lib/nextStep'
 import { getLiveUser } from '@/lib/session'
+import { authFetch } from '@/lib/apiFetch'
 
 /**
  * Onboarding is a ONE-TIME step per profile. Fresh sign-ups flow here from
@@ -61,7 +62,7 @@ function Guard() {
           userId = live.id
           localComplete = isProfileComplete(reconciled)
         }
-        const res = await fetch('/api/user/profile?user_id=' + userId).then(r => r.json()).catch(() => ({}))
+        const res = await authFetch('/api/user/profile?user_id=' + userId).then(r => r.json()).catch(() => ({}))
         const dbProfile = res?.profile || null
         if (dbProfile) setProfile(dbProfile)
         if (isProfileComplete(dbProfile) || localComplete) {

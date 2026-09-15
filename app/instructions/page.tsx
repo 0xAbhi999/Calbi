@@ -6,6 +6,7 @@ import { Stepper } from '@/components/Stepper'
 import { useEffect, useRef, useState } from 'react'
 import { resolveInstructionsRedirect, safeRead } from '@/lib/attemptAccess'
 import { AFTER_ASSESSMENT_ROUTE } from '@/lib/nextStep'
+import { authFetch } from '@/lib/apiFetch'
 
 const ALLOCATION = [
   [1, 'English Communication', '15 min'],
@@ -77,7 +78,7 @@ function Inner(){
     const finish = () => { if (cancelled || settled) return; settled = true; setGate('show') }
     const timer = setTimeout(finish, SCORES_LOOKUP_TIMEOUT_MS)
 
-    fetch('/api/user/scores?student_id=' + user.id)
+    authFetch('/api/user/scores?student_id=' + user.id)
       .then(r => r.json())
       .then(d => { if (cancelled) return; clearTimeout(timer); if (d?.result) go(AFTER_ASSESSMENT_ROUTE); else finish() })
       .catch(() => { clearTimeout(timer); finish() })
@@ -101,7 +102,7 @@ function Inner(){
       const userData = await userRes.json()
       const studentId = userData?.user?.id || (user?.id || '')
       if (studentId) {
-        const sessionRes = await fetch('/api/user/session', {
+        const sessionRes = await authFetch('/api/user/session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ student_id: studentId, question_seed: seed }),
@@ -113,7 +114,7 @@ function Inner(){
     if (!session) {
       session = { id: 'sess_'+Math.random().toString(16).slice(2,10), student_id: user?.id || '', started_at: new Date(now).toISOString(), expires_at: new Date(now+7200*1000).toISOString(), duration_sec: 7200, status:'in_progress', question_seed: seed }
       try {
-        await fetch('/api/user/session', {
+        await authFetch('/api/user/session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ...session, student_id: user?.id || session.student_id || 'unknown' }),

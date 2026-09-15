@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto'
 import { NextResponse } from 'next/server'
 import { saveAssessmentSession, getAssessmentSession, type AssessmentSession } from '@/lib/db'
-import { getServerClient } from '@/lib/supabaseServer'
+import { getClientForRequest } from '@/lib/supabaseServer'
 import { fetchAssessmentSession, persistAssessmentSession, toUuid } from '@/lib/persist'
 
 export async function GET(req: Request) {
@@ -9,7 +9,7 @@ export async function GET(req: Request) {
     const url = new URL(req.url)
     const sessionId = url.searchParams.get('session_id') || ''
     if (!sessionId) return NextResponse.json({ error: 'Missing session_id' }, { status: 400 })
-    const sb = getServerClient()
+    const sb = getClientForRequest(req)
     if (sb) {
       const data = await fetchAssessmentSession(sb, sessionId)
       if (data) return NextResponse.json({ session: data, supabase: true })
@@ -27,7 +27,7 @@ export async function POST(req: Request) {
     const originalId = (body.session_id || '').toString()
     // The session may only exist in Supabase (fresh serverless instance), so
     // fall back to reading it there before deciding to create a new row.
-    const sb = getServerClient()
+    const sb = getClientForRequest(req)
     let session = getAssessmentSession(originalId)
     if (!session && sb) {
       const remote = originalId ? await fetchAssessmentSession(sb, toUuid(originalId, 'session') || originalId) : null

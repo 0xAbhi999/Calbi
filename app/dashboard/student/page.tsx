@@ -14,6 +14,8 @@ import { getLiveUser } from '@/lib/session'
 import { ReportModal } from '@/components/ReportModal'
 import { SkillChips } from '@/components/SkillChips'
 import { WhatsAppCommunityCard } from '@/components/WhatsAppCommunity'
+import { authFetch } from '@/lib/apiFetch'
+import { SyncWarningBanner } from '@/components/SyncWarningBanner'
 
 function Inner(){
   const router = useRouter()
@@ -97,13 +99,13 @@ function Inner(){
     const now = Date.now()
     if(!force && now - lastRefreshRef.current < 60000) return
     lastRefreshRef.current = now
-    fetch('/api/user/profile?user_id='+user.id).then(r=>r.json()).then(data=>{
+    authFetch('/api/user/profile?user_id='+user.id).then(r=>r.json()).then(data=>{
       if(data.profile) setProfile(data.profile)
     }).catch(()=>{})
-    fetch('/api/user/resume?student_id='+user.id).then(r=>r.json()).then(data=>{
+    authFetch('/api/user/resume?student_id='+user.id).then(r=>r.json()).then(data=>{
       if(data.analysis) setResume(data.analysis)
     }).catch(()=>{})
-    fetch('/api/user/scores?student_id='+user.id).then(r=>r.json()).then(data=>{
+    authFetch('/api/user/scores?student_id='+user.id).then(r=>r.json()).then(data=>{
       // Always write through — including `null` when there is no result, so a
       // stale cached score from a deleted/previous account never lingers on
       // screen or in the downloaded PDF.
@@ -162,6 +164,7 @@ function Inner(){
     <div>
       <Navbar />
       <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
+      <SyncWarningBanner className="mb-5" />
         <div className="animate-fade-up">
           <h1 className="text-2xl font-black text-slate-900">Hello{profile?.full_name ? `, ${profile.full_name.split(' ')[0]}` : ''} 👋</h1>
           <p className="text-slate-500 text-sm mt-1">Here's your readiness overview and next steps.</p>

@@ -13,7 +13,8 @@
     "loadtest": "node scripts/loadtest.js",
     "loadtest:k6": "k6 run scripts/loadtest.k6.js",
     "seed:supabase": "node --experimental-strip-types scripts/seed-supabase.ts",
-    "verify:sql": "node scripts/verify-student-report.mjs"
+    "verify:sql": "node scripts/verify-student-report.mjs",
+    "verify:rls": "node scripts/verify-rls-writes.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.115.0",

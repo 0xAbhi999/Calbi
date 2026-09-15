@@ -40,6 +40,9 @@ import {
   normalizePhone,
   normalizePrn,
 } from '@/lib/validate'
+import { authFetch } from '@/lib/apiFetch'
+import { noteSyncWarning } from '@/lib/syncNotice'
+import { SyncWarningBanner } from '@/components/SyncWarningBanner'
 
 function Field({
   label, hint, error, children, htmlFor, className = '',
@@ -82,7 +85,7 @@ export default function EditProfilePage() {
       setLoaded(true)
       return
     }
-    fetch('/api/user/profile?user_id=' + user.id)
+    authFetch('/api/user/profile?user_id=' + user.id)
       .then((r) => r.json())
       .then((d) => {
         if (d.profile) {
@@ -146,13 +149,14 @@ export default function EditProfilePage() {
       cgpa: Number(form.cgpa),
     }
     try {
-      const res = await fetch('/api/user/profile', {
+      const res = await authFetch('/api/user/profile', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || 'Could not save your profile.')
+      noteSyncWarning(data)
       setProfile(data.profile || payload)
     } catch (err: any) {
       // Offline / demo mode — still keep the local store so the change sticks.
@@ -199,6 +203,7 @@ export default function EditProfilePage() {
       </div>
       <Navbar />
       <main className="mx-auto max-w-3xl px-4 pb-20 pt-8 sm:px-6">
+      <SyncWarningBanner className="mb-5" />
         <div className="flex items-center justify-between gap-3 animate-fade-up">
           <div>
             <h1 className="text-2xl font-black text-slate-900 sm:text-3xl">Edit your profile</h1>

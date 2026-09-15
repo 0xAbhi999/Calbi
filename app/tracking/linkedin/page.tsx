@@ -3,6 +3,8 @@ import { useRouter } from 'next/navigation'
 import { Navbar } from '@/components/Navbar'
 import { useStore } from '@/lib/store'
 import { Stepper } from '@/components/Stepper'
+import { authFetch } from '@/lib/apiFetch'
+import { noteSyncWarning } from '@/lib/syncNotice'
 
 function Inner(){
   const router = useRouter()
@@ -10,11 +12,12 @@ function Inner(){
   const complete = async ()=>{
     setTracking({...tracking, linkedin:true})
     try {
-      await fetch('/api/user/tracking', {
+      const res = await authFetch('/api/user/tracking', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ user_id: user?.id, action: 'follow_linkedin', completed: true }),
       })
+      noteSyncWarning(await res.json().catch(() => ({})))
     } catch { /* demo mode */ }
     setTimeout(()=> router.replace('/confirmation'), 450)
   }
