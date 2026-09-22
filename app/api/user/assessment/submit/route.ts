@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto'
 import { NextResponse } from 'next/server'
 import { saveAssessmentResult, saveAssessmentSession, getAssessmentSession, flushDB, type AssessmentSession } from '@/lib/db'
 import { getClientForRequest } from '@/lib/supabaseServer'
-import { persistAssessmentResult, persistAssessmentSession, toUuid } from '@/lib/persist'
+import { persistAssessmentResultDetailed, persistAssessmentSessionDetailed, syncWarning, toUuid } from '@/lib/persist'
 
 export async function POST(req: Request) {
   try {
@@ -58,16 +58,24 @@ export async function POST(req: Request) {
     await flushDB()
     // Mirror to Supabase: session status first (FK for the result row), then
     // the result — this is what makes the score survive a re-login.
-    let supabase = false
     const sb = getClientForRequest(req)
+    let outcome = null as Awaited<ReturnType<typeof persistAssessmentResultDetailed>> | null
     if (sb) {
-      const sessionOk = await persistAssessmentSession(sb, { ...s, ...body, answers: body.answers || s.answers })
-      supabase = await persistAssessmentResult(sb, result)
-      if (!supabase && sessionOk) {
+      const sessionOutcome = await persistAssessmentSessionDetailed(sb, { ...s, ...body, answers: body.answers || s.answers })
+      outcome = await persistAssessmentResultDetailed(sb, result)
+      if (!outcome.ok && sessionOutcome.ok) {
         console.warn('[supabase] result persist failed for session', sessionId)
       }
+      // The score is the thing the student must not lose: prefer the result's
+      // reason, but never hide a session failure behind a successful result.
+      if (outcome.ok && !sessionOutcome.ok) outcome = sessionOutcome
     }
-    return NextResponse.json({ result, saved: true, supabase })
+    return NextResponse.json({
+      result,
+      saved: true,
+      supabase: !!outcome?.ok,
+      sync_warning: syncWarning(outcome),
+    })
   } catch (e: any) {
     return NextResponse.json({ error: e.message || 'Failed to submit assessment' }, { status: 500 })
   }

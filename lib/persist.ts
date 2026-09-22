@@ -245,6 +245,8 @@ export interface PersistOutcome {
   rls?: boolean
   /** The id is not a UUID, so Postgres could never store the row. */
   notUuid?: boolean
+  /** A referenced row (usually public.profiles) does not exist — 23503. */
+  foreignKey?: boolean
 }
 
 const DUPLICATE_KEY = '23505'
@@ -260,6 +262,7 @@ function outcomeOf(error: any): PersistOutcome {
     message: String(error?.message ?? error ?? 'Unknown database error'),
     tableMissing: code === UNDEFINED_TABLE,
     rls: code === RLS_VIOLATION,
+    foreignKey: code === FK_VIOLATION,
   }
 }
 
@@ -279,6 +282,11 @@ export function syncWarning(outcome?: PersistOutcome | null): string | null {
   }
   if (outcome.tableMissing) {
     return 'Saved on this device — the Supabase table is missing. Run supabase/schema.sql (or the migrations) in the Supabase SQL editor.'
+  }
+  if (outcome.foreignKey) {
+    return 'Saved on this device — Supabase has no profiles row for this student yet, so the related row was refused ' +
+      '(profiles.id must exist in auth.users). Re-run supabase/schema.sql so the on_auth_user_created trigger exists, ' +
+      'or supabase/queries/fix_admin_sync_missing_auth_users.sql for the seeded candidates.'
   }
   if (outcome.notUuid) {
     return 'Saved on this device — this account is a local demo id, not a Supabase user, so it cannot be mirrored to Postgres.'
@@ -543,10 +551,20 @@ export async function expireActiveAssessmentSessions(
  * any older active session before retrying.
  */
 export async function persistAssessmentSession(client: SupabaseClient, s: any): Promise<boolean> {
+  return (await persistAssessmentSessionDetailed(client, s)).ok
+}
+
+/** Same write, reporting WHY it failed (see `persistProfileDetailed`). */
+export async function persistAssessmentSessionDetailed(client: SupabaseClient, s: any): Promise<PersistOutcome> {
   const studentId = toUuid(s.student_id, 'profile')
   if (!studentId) {
     console.warn('[supabase] session persist skipped: invalid student_id')
-    return false
+    return {
+      ok: false,
+      code: '22P02',
+      message: `Assessment session has no student_id ("${String(s.student_id ?? '').trim() || 'empty'}").`,
+      notUuid: true,
+    }
   }
   const row = {
     id: toUuid(s.id, 'session') || randomUUID(),
@@ -565,21 +583,31 @@ export async function persistAssessmentSession(client: SupabaseClient, s: any): 
     if ((error as any).code === '23505') {
       await expireActiveAssessmentSessions(client, studentId, row.id)
       const retry = await client.from('assessment_sessions').upsert(row, { onConflict: 'id' })
-      if (!retry.error) return true
+      if (!retry.error) return { ok: true }
     }
     console.warn('[supabase] session persist failed:', error.message)
-    return false
+    return outcomeOf(error)
   }
-  return true
+  return { ok: true }
 }
 
 /** Mirrors the final evaluation result (scores) into public.assessment_results. */
 export async function persistAssessmentResult(client: SupabaseClient, r: any): Promise<boolean> {
+  return (await persistAssessmentResultDetailed(client, r)).ok
+}
+
+/** Same write, reporting WHY it failed (see `persistProfileDetailed`). */
+export async function persistAssessmentResultDetailed(client: SupabaseClient, r: any): Promise<PersistOutcome> {
   const studentId = toUuid(r.student_id, 'profile')
   const sessionId = toUuid(r.session_id, 'session')
   if (!studentId || !sessionId) {
     console.warn('[supabase] result persist skipped: invalid student_id/session_id')
-    return false
+    return {
+      ok: false,
+      code: '22P02',
+      message: `Assessment result is missing student_id/session_id ("${String(r.student_id ?? '')}" / "${String(r.session_id ?? '')}").`,
+      notUuid: true,
+    }
   }
   const { error } = await client.from('assessment_results').upsert(
     {
@@ -597,9 +625,9 @@ export async function persistAssessmentResult(client: SupabaseClient, r: any): P
   )
   if (error) {
     console.warn('[supabase] result persist failed:', error.message)
-    return false
+    return outcomeOf(error)
   }
-  return true
+  return { ok: true }
 }
 
 /** Loads an assessment session by id from Supabase (service-role read). */

@@ -70,6 +70,20 @@ Two ways to write, both supported:
 
 A write that does not land is no longer silent: the route answers `{ saved: true, supabase: false, sync_warning: "…row-level security…" }` and the candidate sees an amber banner on the dashboard/profile/onboarding pages (`components/SyncWarningBanner.tsx`) instead of a plain "Saved".
 
+**Start here** — one request says which of the two modes the deployment is in:
+
+```bash
+curl -s https://<your-domain>/api/health | jq .supabase
+# { "configured": true, "server_client": true, "service_role": false, "writes_as": "user_token" }
+```
+
+| Field | Meaning when wrong |
+|---|---|
+| `configured: false` | `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` were missing **at build time** — they are inlined into the browser bundle, so exporting them only at runtime leaves the client in demo mode and no access token can be forwarded. Rebuild with them present. |
+| `server_client: false` (while `configured: true`) | The URL/key is unusable, or `@supabase/supabase-js` resolved to the compile-time stub (`next.config.js` aliases it when the package is missing). Run `npm install` on the server and rebuild. |
+| `writes_as: "anon"` | No service-role key **and** the request carried no access token — RLS will reject every student write. Make sure the browser is signed in (the token comes from supabase-js) or set `SUPABASE_SERVICE_ROLE_KEY`. |
+| `sync_warning` mentions `profiles row` / `auth.users` | Postgres refused the row on the FK: no `profiles` row exists for that student. Re-run `supabase/schema.sql` (creates the `on_auth_user_created` trigger) or `supabase/queries/fix_admin_sync_missing_auth_users.sql` for the seeded candidates. |
+
 To check the policies themselves without a Supabase project:
 
 ```bash

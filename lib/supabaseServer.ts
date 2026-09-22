@@ -134,3 +134,37 @@ export function resetRequestClients(): void {
 export function getClientForRequest(req?: { headers?: HeadersLike } | null): SupabaseClient | null {
   return getClientForToken(bearerToken(req))
 }
+
+/**
+ * Plain-words answer to "why is nothing reaching my Supabase?".
+ *
+ * Exposed on /api/health so a deployment can be diagnosed in one request
+ * instead of by reading logs. No secrets are included — only whether things
+ * are configured and which identity writes will use:
+ *
+ *   configured     NEXT_PUBLIC_SUPABASE_URL + ANON_KEY are present. NOTE these
+ *                  are inlined into the browser bundle at BUILD time, so a
+ *                  server that only exports them at runtime leaves the client
+ *                  in demo mode — and then no access token can be forwarded.
+ *   server_client  a server-side client could actually be created. False while
+ *                  `configured` is true means the URL/key is unusable or
+ *                  @supabase/supabase-js resolved to the compile-time stub.
+ *   writes_as      service_role (bypasses RLS) | user_token (RLS as the
+ *                  student) | anon (RLS will reject every student write).
+ */
+export function supabaseDiagnostics(): {
+  configured: boolean
+  server_client: boolean
+  service_role: boolean
+  writes_as: 'service_role' | 'user_token' | 'anon' | 'none'
+} {
+  const configured = isSupabaseConfigured()
+  const serverClient = !!getServerClient()
+  const serviceRole = hasServiceRoleKey()
+  return {
+    configured,
+    server_client: serverClient,
+    service_role: serviceRole,
+    writes_as: !serverClient ? 'none' : serviceRole ? 'service_role' : 'user_token',
+  }
+}

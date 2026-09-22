@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto'
 import { NextResponse } from 'next/server'
 import { saveAssessmentSession, getActiveSessionForStudent, getAssessmentSession, flushDB, type AssessmentSession } from '@/lib/db'
 import { getClientForRequest } from '@/lib/supabaseServer'
-import { fetchActiveAssessmentSession, fetchAssessmentSession, persistAssessmentSession, toUuid } from '@/lib/persist'
+import { fetchActiveAssessmentSession, fetchAssessmentSession, persistAssessmentSessionDetailed, syncWarning, toUuid } from '@/lib/persist'
 
 export async function GET(req: Request) {
   try {
@@ -62,9 +62,13 @@ export async function POST(req: Request) {
     // proceeds, or a crash would lose the fact they ever started.
     await flushDB()
     const sb = getClientForRequest(req)
-    let supabase = false
-    if (sb) supabase = await persistAssessmentSession(sb, session)
-    return NextResponse.json({ session, saved: true, supabase })
+    const outcome = sb ? await persistAssessmentSessionDetailed(sb, session) : null
+    return NextResponse.json({
+      session,
+      saved: true,
+      supabase: !!outcome?.ok,
+      sync_warning: syncWarning(outcome),
+    })
   } catch (e: any) {
     return NextResponse.json({ error: e.message || 'Failed to save session' }, { status: 500 })
   }

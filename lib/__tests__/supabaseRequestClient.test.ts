@@ -30,7 +30,13 @@ import {
   hasServiceRoleKey,
   resetRequestClients,
 } from '../supabaseServer.ts'
-import { persistProfileDetailed, persistTrackingEventDetailed, syncWarning } from '../persist.ts'
+import {
+  persistAssessmentResultDetailed,
+  persistAssessmentSessionDetailed,
+  persistProfileDetailed,
+  persistTrackingEventDetailed,
+  syncWarning,
+} from '../persist.ts'
 
 const PORT = 54398
 /** Headers PostgREST received, per request, so the token plumbing is visible. */
@@ -192,4 +198,59 @@ test('syncWarning is null when the write landed', () => {
   assert.equal(syncWarning({ ok: true }), null)
   assert.equal(syncWarning(null), null)
   assert.equal(syncWarning(undefined), null)
+})
+
+/* ------------------------------------------------------------------ */
+/* 3. assessment sessions / results report failures the same way       */
+/* ------------------------------------------------------------------ */
+
+test('a missing profiles row (23503) says which row is missing', async () => {
+  resetRequestClients()
+  failWrites = {
+    code: '23503',
+    message: 'insert or update on table "assessment_sessions" violates foreign key constraint "assessment_sessions_student_id_fkey"',
+  }
+  try {
+    const client = getClientForToken('user-jwt-9')!
+    const outcome = await persistAssessmentSessionDetailed(client, {
+      id: 'aaaaaaaa-0000-4000-8000-000000000001', student_id: UID, status: 'in_progress', answers: { q1: 'a' },
+    })
+    assert.equal(outcome.ok, false)
+    assert.equal(outcome.foreignKey, true)
+    const warning = syncWarning(outcome)!
+    assert.match(warning, /no profiles row/)
+    assert.match(warning, /auth\.users/)
+    assert.match(warning, /on_auth_user_created/)
+  } finally {
+    failWrites = null
+  }
+})
+
+test('sessions and results land when the caller owns the row', async () => {
+  resetRequestClients()
+  const client = getClientForToken('user-jwt-10')!
+  const session = await persistAssessmentSessionDetailed(client, {
+    id: 'aaaaaaaa-0000-4000-8000-000000000002', student_id: UID, status: 'in_progress',
+    answers: { q1: 'a' }, tab_switches: 0, duration_sec: 7200,
+  })
+  assert.equal(session.ok, true)
+  const result = await persistAssessmentResultDetailed(client, {
+    session_id: 'aaaaaaaa-0000-4000-8000-000000000002', student_id: UID,
+    scores: { total: 760 }, total: 760, grade: 'A', percentile: 84.2,
+  })
+  assert.equal(result.ok, true)
+  const write = seen.filter((s) => s.method === 'POST').at(-1)!
+  assert.equal(write.authorization, 'Bearer user-jwt-10', 'the result write carries the student token too')
+  assert.match(write.url, /^\/rest\/v1\/assessment_results/)
+})
+
+test('a session with no student id is refused before it reaches Postgres', async () => {
+  resetRequestClients()
+  const before = seen.length
+  const outcome = await persistAssessmentSessionDetailed(getClientForToken('user-jwt-11')!, {
+    id: 'aaaaaaaa-0000-4000-8000-000000000003', student_id: '', status: 'in_progress',
+  })
+  assert.equal(outcome.ok, false)
+  assert.equal(seen.length, before, 'no request was sent')
+  assert.ok(syncWarning(outcome))
 })

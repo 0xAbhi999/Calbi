@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto'
 import { NextResponse } from 'next/server'
 import { saveAssessmentSession, getAssessmentSession, type AssessmentSession } from '@/lib/db'
 import { getClientForRequest } from '@/lib/supabaseServer'
-import { fetchAssessmentSession, persistAssessmentSession, toUuid } from '@/lib/persist'
+import { fetchAssessmentSession, persistAssessmentSessionDetailed, syncWarning, toUuid } from '@/lib/persist'
 
 export async function GET(req: Request) {
   try {
@@ -54,15 +54,19 @@ export async function POST(req: Request) {
     if (body.submitted_at) session.submitted_at = body.submitted_at
     if (body.tab_switches !== undefined) session.tab_switches = body.tab_switches
     saveAssessmentSession(session)
-    let supabase = false
-    if (sb) supabase = await persistAssessmentSession(sb, session)
+    const outcome = sb ? await persistAssessmentSessionDetailed(sb, session) : null
     // Autosave requests already carry the latest answers from the browser. Do
     // not echo that growing JSONB blob back on every checkpoint; the old echo
     // multiplied answer payload bytes across all candidates and made the API
     // unnecessarily chatty. A caller that needs answers uses GET explicitly.
     const acknowledged = { ...session }
     delete (acknowledged as any).answers
-    return NextResponse.json({ session: acknowledged, saved: true, supabase })
+    return NextResponse.json({
+      session: acknowledged,
+      saved: true,
+      supabase: !!outcome?.ok,
+      sync_warning: syncWarning(outcome),
+    })
   } catch (e: any) {
     return NextResponse.json({ error: e.message || 'Failed to save assessment' }, { status: 500 })
   }
