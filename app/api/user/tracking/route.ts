@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { getTrackingEvents, saveTrackingEvent } from '@/lib/db'
-import { getServerClient } from '@/lib/supabaseServer'
-import { persistTrackingEvent } from '@/lib/persist'
+import { getClientForRequest } from '@/lib/supabaseServer'
+import { persistTrackingEventDetailed, syncWarning } from '@/lib/persist'
 
 export async function GET(req: Request) {
   try {
@@ -26,10 +26,14 @@ export async function POST(req: Request) {
       completed_at: body.completed ? new Date().toISOString() : undefined,
     }
     saveTrackingEvent(event)
-    const sb = getServerClient()
-    let supabase = false
-    if (sb) supabase = await persistTrackingEvent(sb, event)
-    return NextResponse.json({ event, saved: true, supabase })
+    const sb = getClientForRequest(req)
+    const outcome = sb ? await persistTrackingEventDetailed(sb, event) : null
+    return NextResponse.json({
+      event,
+      saved: true,
+      supabase: !!outcome?.ok,
+      sync_warning: syncWarning(outcome),
+    })
   } catch (e: any) {
     return NextResponse.json({ error: e.message || 'Failed to save tracking' }, { status: 500 })
   }

@@ -33,6 +33,8 @@ import {
   WATERMARK_TILE_HEIGHT,
 } from '@/lib/proctoring'
 import type { ScreenFacts } from '@/lib/proctoring'
+import { authFetch } from '@/lib/apiFetch'
+import { noteSyncWarning } from '@/lib/syncNotice'
 
 const STAGES = [
   { id: 'english', label: 'English Communication', sub: ['Listening', 'Speaking', 'Reading', 'Writing'], min: 15 },
@@ -421,7 +423,7 @@ function AssessmentInner() {
       autosaveTimerRef.current = setTimeout(() => {
         autosaveTimerRef.current = null
         autosaveLastSentRef.current = Date.now()
-        fetch('/api/user/assessment', {
+        authFetch('/api/user/assessment', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ session_id: sid, student_id: user?.id || '', answers, status: 'in_progress' }),
@@ -980,16 +982,19 @@ function AssessmentInner() {
     // doubling database work, that race could leave the session and result out
     // of sync. Keep browser code transport-only; the API owns Postgres writes.
     try {
-      await fetch('/api/user/assessment', {
+      await authFetch('/api/user/assessment', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sid, student_id: user?.id || '', answers, status: auto ? 'expired' : 'submitted', tab_switches: strikes, submitted_at: new Date().toISOString() }),
       })
-      await fetch('/api/user/assessment/submit', {
+      const submitRes = await authFetch('/api/user/assessment/submit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sid, student_id: user?.id || 'unknown', scores: payload, total: payload.total, grade: payload.grade, percentile: payload.percentile, verifiable_hash: payload.verifiable_hash, ai_feedback: aiResults }),
       })
+      // The score is on this device either way; if Postgres rejected the write
+      // the candidate (and the admin dashboard) must be able to see that.
+      noteSyncWarning(await submitRes.json().catch(() => ({})))
     } catch (e) { /* demo mode */ }
     const s = JSON.parse(localStorage.getItem('calibiai_session') || '{}')
     s.status = 'submitted'

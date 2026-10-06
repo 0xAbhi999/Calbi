@@ -6,6 +6,8 @@ import { Stepper } from '@/components/Stepper'
 import { useEffect, useRef, useState } from 'react'
 import { resolveInstructionsRedirect, safeRead } from '@/lib/attemptAccess'
 import { AFTER_ASSESSMENT_ROUTE } from '@/lib/nextStep'
+import { authFetch } from '@/lib/apiFetch'
+import { noteSyncWarning } from '@/lib/syncNotice'
 
 const ALLOCATION = [
   [1, 'English Communication', '15 min'],
@@ -77,7 +79,7 @@ function Inner(){
     const finish = () => { if (cancelled || settled) return; settled = true; setGate('show') }
     const timer = setTimeout(finish, SCORES_LOOKUP_TIMEOUT_MS)
 
-    fetch('/api/user/scores?student_id=' + user.id)
+    authFetch('/api/user/scores?student_id=' + user.id)
       .then(r => r.json())
       .then(d => { if (cancelled) return; clearTimeout(timer); if (d?.result) go(AFTER_ASSESSMENT_ROUTE); else finish() })
       .catch(() => { clearTimeout(timer); finish() })
@@ -92,32 +94,34 @@ function Inner(){
     const now = Date.now()
     const seed = Math.floor(Math.random()*1_000_000_000)
     let session:any = null
-    try {
-      const userRes = await fetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: 'demo@calibiai.local', password: 'demo' }),
-      })
-      const userData = await userRes.json()
-      const studentId = userData?.user?.id || (user?.id || '')
-      if (studentId) {
-        const sessionRes = await fetch('/api/user/session', {
+    // The attempt belongs to the SIGNED-IN candidate. This used to sign in as a
+    // hardcoded demo account first and take the student id from that response,
+    // so whenever that account existed the session (and later the score) was
+    // attributed to it instead of to the student taking the test.
+    const studentId = user?.id || ''
+    if (studentId) {
+      try {
+        const sessionRes = await authFetch('/api/user/session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ student_id: studentId, question_seed: seed }),
         })
-        const sessionData = await sessionRes.json()
+        const sessionData = await sessionRes.json().catch(() => ({}))
         if (sessionData.session) session = sessionData.session
-      }
-    } catch (e) { /* fall through */ }
+        // Supabase configured but the session row did not land: keep going
+        // (localStorage is the recovery layer) but make the gap visible.
+        noteSyncWarning(sessionData)
+      } catch { /* fall through to the local-only session below */ }
+    }
     if (!session) {
       session = { id: 'sess_'+Math.random().toString(16).slice(2,10), student_id: user?.id || '', started_at: new Date(now).toISOString(), expires_at: new Date(now+7200*1000).toISOString(), duration_sec: 7200, status:'in_progress', question_seed: seed }
       try {
-        await fetch('/api/user/session', {
+        const res = await authFetch('/api/user/session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ...session, student_id: user?.id || session.student_id || 'unknown' }),
         })
+        noteSyncWarning(await res.json().catch(() => ({})))
       } catch { /* demo mode */ }
     }
     try{

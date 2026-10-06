@@ -11,6 +11,9 @@ import { SkillGraph, type SkillDatum } from '@/components/SkillGraph'
 import { ReportModal } from '@/components/ReportModal'
 import { SkillChips } from '@/components/SkillChips'
 import { flattenAssessmentResult } from '@/lib/resultShape'
+import { authFetch } from '@/lib/apiFetch'
+import { noteSyncWarning } from '@/lib/syncNotice'
+import { SyncWarningBanner } from '@/components/SyncWarningBanner'
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -143,9 +146,9 @@ function ProfileInner() {
     if (!user?.id) return
     const load = async () => {
       const [p, s, r] = await Promise.all([
-        fetch('/api/user/profile?user_id=' + user.id).then(x => x.json()).catch(() => ({})),
-        fetch('/api/user/scores?student_id=' + user.id).then(x => x.json()).catch(() => ({})),
-        fetch('/api/user/resume?student_id=' + user.id).then(x => x.json()).catch(() => ({})),
+        authFetch('/api/user/profile?user_id=' + user.id).then(x => x.json()).catch(() => ({})),
+        authFetch('/api/user/scores?student_id=' + user.id).then(x => x.json()).catch(() => ({})),
+        authFetch('/api/user/resume?student_id=' + user.id).then(x => x.json()).catch(() => ({})),
       ])
       if (p.profile) setProfile(p.profile)
       // Always write through — including `null` when there is no result — so a
@@ -189,18 +192,19 @@ function ProfileInner() {
     if (name === displayName) { setEditingName(false); return }
     setSaving(true)
     try {
-      const res = await fetch('/api/user/profile', {
+      const res = await authFetch('/api/user/profile', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ partial: true, user_id: user?.id, email: user?.email, full_name: name }),
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || 'Could not save your name.')
+      noteSyncWarning(data)
       const merged = { ...(profile || {}), id: user?.id, email: user?.email, full_name: name, updated_at: new Date().toISOString() }
       setProfile(merged)
       if (user) setUser({ ...user, name })
       setEditingName(false)
-      showToast('Name updated — saved to Supabase ✓')
+      showToast(data.supabase === false ? 'Name updated on this device (Supabase sync pending)' : 'Name updated — saved to Supabase ✓')
     } catch (e: any) {
       showToast(e?.message || 'Could not save your name.')
     } finally { setSaving(false) }
@@ -210,13 +214,14 @@ function ProfileInner() {
   const saveAvatar = async (cfg: AvatarConfig) => {
     setAvatar(cfg)
     try {
-      const res = await fetch('/api/user/profile', {
+      const res = await authFetch('/api/user/profile', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ partial: true, user_id: user?.id, email: user?.email, ai_avatar: cfg }),
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || 'Could not save your avatar.')
+      noteSyncWarning(data)
       const merged = { ...(profile || {}), id: user?.id, email: user?.email, ai_avatar: cfg, updated_at: new Date().toISOString() }
       setProfile(merged)
       showToast('New AI avatar generated & saved ✓')
@@ -304,6 +309,7 @@ function ProfileInner() {
       <Navbar />
 
       <main className="mx-auto max-w-6xl px-4 sm:px-6 pt-8 space-y-6">
+      <SyncWarningBanner className="mb-5" />
         {/* ================= HERO ================= */}
         <div className="animate-fade-up relative overflow-hidden rounded-[28px] border border-slate-700/40 bg-gradient-to-br from-slate-900 via-[#191834] to-[#241b4d] p-6 sm:p-9 shadow-2xl shadow-indigo-900/20">
           <div aria-hidden className="pointer-events-none absolute -top-24 -right-24 h-72 w-72 rounded-full bg-violet-600/25 blur-3xl" />

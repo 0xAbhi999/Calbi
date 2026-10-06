@@ -32,6 +32,9 @@ import {
   normalizePhone,
   normalizePrn,
 } from '@/lib/validate'
+import { authFetch } from '@/lib/apiFetch'
+import { noteSyncWarning } from '@/lib/syncNotice'
+import { SyncWarningBanner } from '@/components/SyncWarningBanner'
 
 const STEPS = [
   { id: 1, title: 'About you', blurb: 'The basics recruiters see first.', icon: '👤' },
@@ -397,15 +400,18 @@ export function OnboardingFlow({ variant = 'onboarding' }: { variant?: 'onboardi
     }
     setProfile(payload)
     try {
-      const res = await fetch('/api/user/profile', {
+      const res = await authFetch('/api/user/profile', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...payload, user_id: user?.id, email: user?.email }),
       })
+      const data = await res.json().catch(() => ({}))
       if (!res.ok) {
-        const data = await res.json().catch(() => ({}))
         throw new Error(data.error || 'Could not save your profile.')
       }
+      // Supabase configured but the row did not land: keep going (the local
+      // store has the details) but make the gap visible on the next page.
+      noteSyncWarning(data)
     } catch (err: any) {
       // Offline / demo mode: the profile is still kept in the local store.
       console.warn('profile save fell back to local store:', err?.message)
@@ -451,6 +457,7 @@ export function OnboardingFlow({ variant = 'onboarding' }: { variant?: 'onboardi
 
       <main className="mx-auto max-w-6xl px-4 pb-20 pt-6 sm:px-6">
         <Stepper step={2} />
+        <SyncWarningBanner className="mb-5" />
 
         <div className="mt-6 grid gap-6 lg:grid-cols-[minmax(0,320px)_minmax(0,1fr)]">
           {/* ---------------- Left rail: identity + progress ---------------- */}

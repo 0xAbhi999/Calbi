@@ -1,6 +1,7 @@
 import fs from 'fs'
 import path from 'path'
 import { NextResponse } from 'next/server'
+import { supabaseDiagnostics } from '@/lib/supabaseServer'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -46,6 +47,14 @@ export async function GET() {
       heap_total_mb: Math.round(mem.heapTotal / 1048576),
     },
     store: { ok: storeOk, error: storeError },
+    // "Why is nothing landing in Supabase?" — answered without reading logs.
+    // `configured: false` means the NEXT_PUBLIC_* vars were missing at BUILD
+    // time (they are inlined into the browser bundle), so the client runs in
+    // demo mode and can forward no access token; `writes_as: "anon"` means the
+    // server has no service-role key and no caller token, so RLS rejects every
+    // student write. See README → "The student saved, but nothing appears in
+    // Supabase".
+    supabase: supabaseDiagnostics(),
   }
 
   return NextResponse.json(body, {

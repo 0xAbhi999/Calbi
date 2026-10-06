@@ -5,6 +5,8 @@ import { useStore } from '@/lib/store'
 import { Stepper } from '@/components/Stepper'
 import { WHATSAPP_COMMUNITY_URL } from '@/lib/community'
 import { WhatsAppGlyph } from '@/components/WhatsAppCommunity'
+import { authFetch } from '@/lib/apiFetch'
+import { noteSyncWarning } from '@/lib/syncNotice'
 
 function Inner(){
   const router = useRouter()
@@ -12,11 +14,12 @@ function Inner(){
   const complete = async ()=>{
     setTracking({...tracking, whatsapp:true})
     try {
-      await fetch('/api/user/tracking', {
+      const res = await authFetch('/api/user/tracking', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ user_id: user?.id, action: 'join_whatsapp', completed: true }),
       })
+      noteSyncWarning(await res.json().catch(() => ({})))
     } catch { /* demo mode */ }
     setTimeout(()=> router.replace('/tracking/linkedin'), 450)
   }

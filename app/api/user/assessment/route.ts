@@ -1,15 +1,15 @@
 import { randomUUID } from 'crypto'
 import { NextResponse } from 'next/server'
 import { saveAssessmentSession, getAssessmentSession, type AssessmentSession } from '@/lib/db'
-import { getServerClient } from '@/lib/supabaseServer'
-import { fetchAssessmentSession, persistAssessmentSession, toUuid } from '@/lib/persist'
+import { getClientForRequest } from '@/lib/supabaseServer'
+import { fetchAssessmentSession, persistAssessmentSessionDetailed, syncWarning, toUuid } from '@/lib/persist'
 
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url)
     const sessionId = url.searchParams.get('session_id') || ''
     if (!sessionId) return NextResponse.json({ error: 'Missing session_id' }, { status: 400 })
-    const sb = getServerClient()
+    const sb = getClientForRequest(req)
     if (sb) {
       const data = await fetchAssessmentSession(sb, sessionId)
       if (data) return NextResponse.json({ session: data, supabase: true })
@@ -27,7 +27,7 @@ export async function POST(req: Request) {
     const originalId = (body.session_id || '').toString()
     // The session may only exist in Supabase (fresh serverless instance), so
     // fall back to reading it there before deciding to create a new row.
-    const sb = getServerClient()
+    const sb = getClientForRequest(req)
     let session = getAssessmentSession(originalId)
     if (!session && sb) {
       const remote = originalId ? await fetchAssessmentSession(sb, toUuid(originalId, 'session') || originalId) : null
@@ -54,15 +54,19 @@ export async function POST(req: Request) {
     if (body.submitted_at) session.submitted_at = body.submitted_at
     if (body.tab_switches !== undefined) session.tab_switches = body.tab_switches
     saveAssessmentSession(session)
-    let supabase = false
-    if (sb) supabase = await persistAssessmentSession(sb, session)
+    const outcome = sb ? await persistAssessmentSessionDetailed(sb, session) : null
     // Autosave requests already carry the latest answers from the browser. Do
     // not echo that growing JSONB blob back on every checkpoint; the old echo
     // multiplied answer payload bytes across all candidates and made the API
     // unnecessarily chatty. A caller that needs answers uses GET explicitly.
     const acknowledged = { ...session }
     delete (acknowledged as any).answers
-    return NextResponse.json({ session: acknowledged, saved: true, supabase })
+    return NextResponse.json({
+      session: acknowledged,
+      saved: true,
+      supabase: !!outcome?.ok,
+      sync_warning: syncWarning(outcome),
+    })
   } catch (e: any) {
     return NextResponse.json({ error: e.message || 'Failed to save assessment' }, { status: 500 })
   }

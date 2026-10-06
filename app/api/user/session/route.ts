@@ -1,8 +1,8 @@
 import { randomUUID } from 'crypto'
 import { NextResponse } from 'next/server'
 import { saveAssessmentSession, getActiveSessionForStudent, getAssessmentSession, flushDB, type AssessmentSession } from '@/lib/db'
-import { getServerClient } from '@/lib/supabaseServer'
-import { fetchActiveAssessmentSession, fetchAssessmentSession, persistAssessmentSession, toUuid } from '@/lib/persist'
+import { getClientForRequest } from '@/lib/supabaseServer'
+import { fetchActiveAssessmentSession, fetchAssessmentSession, persistAssessmentSessionDetailed, syncWarning, toUuid } from '@/lib/persist'
 
 export async function GET(req: Request) {
   try {
@@ -11,7 +11,7 @@ export async function GET(req: Request) {
     const studentId = url.searchParams.get('student_id') || ''
     // Supabase may hold the session even when the local JSON store lost it
     // (serverless instance / fresh deploy) — check it first when configured.
-    const sb = getServerClient()
+    const sb = getClientForRequest(req)
     if (sb) {
       if (sessionId) {
         const data = await fetchAssessmentSession(sb, sessionId)
@@ -61,10 +61,14 @@ export async function POST(req: Request) {
     // The start of a 120-minute attempt must be on disk before the candidate
     // proceeds, or a crash would lose the fact they ever started.
     await flushDB()
-    const sb = getServerClient()
-    let supabase = false
-    if (sb) supabase = await persistAssessmentSession(sb, session)
-    return NextResponse.json({ session, saved: true, supabase })
+    const sb = getClientForRequest(req)
+    const outcome = sb ? await persistAssessmentSessionDetailed(sb, session) : null
+    return NextResponse.json({
+      session,
+      saved: true,
+      supabase: !!outcome?.ok,
+      sync_warning: syncWarning(outcome),
+    })
   } catch (e: any) {
     return NextResponse.json({ error: e.message || 'Failed to save session' }, { status: 500 })
   }

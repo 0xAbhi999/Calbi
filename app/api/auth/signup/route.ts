@@ -1,8 +1,8 @@
 import { NextResponse } from 'next/server'
 import { getUserByEmail, createUser } from '@/lib/db'
 import { hashPassword } from '@/lib/auth'
-import { getServerClient } from '@/lib/supabaseServer'
-import { persistProfile, supabaseSignUp } from '@/lib/persist'
+import { getServerClient, getClientForToken } from '@/lib/supabaseServer'
+import { persistProfileDetailed, supabaseSignUp, syncWarning } from '@/lib/persist'
 import { checkRateLimit } from '@/lib/rateLimit'
 
 export async function POST(req: Request) {
@@ -33,7 +33,12 @@ export async function POST(req: Request) {
     if (sb) {
       try {
         const auth = await supabaseSignUp(sb, { email, password, full_name: fullName, role })
-        await persistProfile(sb, { id: auth.user.id, email, full_name: fullName })
+        // The on_auth_user_created trigger seeds profiles(id, email,
+        // full_name); the rest of the row arrives with onboarding. This write
+        // goes out with the token just issued so the RLS policy
+        // (`auth.uid() = id`) accepts it even with no service-role key.
+        const asUser = getClientForToken(auth.access_token) || sb
+        const outcome = await persistProfileDetailed(asUser, { id: auth.user.id, email, full_name: fullName })
         return NextResponse.json({
           user: {
             id: auth.user.id,
@@ -44,7 +49,8 @@ export async function POST(req: Request) {
           },
           access_token: auth.access_token,
           refresh_token: auth.refresh_token,
-          supabase: true,
+          supabase: outcome.ok,
+          sync_warning: syncWarning(outcome),
           message: 'Account created successfully.',
         }, { status: 201 })
       } catch (e: any) {

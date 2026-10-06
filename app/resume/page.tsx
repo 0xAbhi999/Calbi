@@ -4,6 +4,9 @@ import Link from 'next/link'
 import { Navbar } from '@/components/Navbar'
 import { useStore } from '@/lib/store'
 import { Stepper } from '@/components/Stepper'
+import { authFetch } from '@/lib/apiFetch'
+import { noteSyncWarning } from '@/lib/syncNotice'
+import { SyncWarningBanner } from '@/components/SyncWarningBanner'
 
 function ScoreRing({ score }: { score: number }) {
   const tone = score >= 75 ? '#10b981' : score >= 50 ? '#f59e0b' : '#f43f5e'
@@ -65,9 +68,10 @@ function ResumeInner() {
       fd.append('full_name', profile?.full_name || user?.name || '')
       fd.append('degree', profile?.degree || '')
       fd.append('skills', profile?.skills || '')
-      const res = await fetch('/api/user/resume/analyze', { method: 'POST', body: fd })
+      const res = await authFetch('/api/user/resume/analyze', { method: 'POST', body: fd })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Analysis failed.')
+      noteSyncWarning(data)
       setDone(data.analysis)
       setResume(data.analysis)
     } catch (e: any) {
@@ -86,6 +90,7 @@ function ResumeInner() {
     <div>
       <Navbar />
       <main className="mx-auto max-w-6xl px-4 sm:px-6 py-8">
+      <SyncWarningBanner className="mb-5" />
         {!editMode && <Stepper step={3} />}
         <div className="mt-6 grid lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)] gap-6 items-start">
           {/* Upload */}

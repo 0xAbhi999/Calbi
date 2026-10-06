@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { saveResumeAnalysis } from '@/lib/db'
-import { getServerClient } from '@/lib/supabaseServer'
-import { persistResumeAnalysis } from '@/lib/persist'
+import { getClientForRequest } from '@/lib/supabaseServer'
+import { persistResumeAnalysisDetailed, syncWarning } from '@/lib/persist'
 import { createLimiter } from '@/lib/concurrency'
 import { checkRateLimit, getClientIp } from '@/lib/rateLimit'
 import {
@@ -80,10 +80,13 @@ export async function POST(req: Request) {
       ...analysis,
     }
     saveResumeAnalysis(record as any)
-    const sb = getServerClient()
-    let supabase = false
-    if (sb) supabase = await persistResumeAnalysis(sb, record)
-    return NextResponse.json({ analysis: record, supabase })
+    const sb = getClientForRequest(req)
+    const outcome = sb ? await persistResumeAnalysisDetailed(sb, record) : null
+    return NextResponse.json({
+      analysis: record,
+      supabase: !!outcome?.ok,
+      sync_warning: syncWarning(outcome),
+    })
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || 'Resume analysis failed.' }, { status: 500 })
   } finally {

@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { getUserByEmail, updateUserLogin, getLatestAssessmentResultForStudent, getProfileById } from '@/lib/db'
 import { verifyPassword } from '@/lib/auth'
 import { isProfileComplete } from '@/lib/validate'
-import { getServerClient } from '@/lib/supabaseServer'
+import { getServerClient, getClientForToken } from '@/lib/supabaseServer'
 import { fetchProfile, hasAssessmentResult, supabaseSignIn } from '@/lib/persist'
 import { checkRateLimit } from '@/lib/rateLimit'
 
@@ -33,8 +33,13 @@ export async function POST(req: Request) {
     if (sb) {
       try {
         const auth = await supabaseSignIn(sb, { email, password })
-        const hasAssessment = await hasAssessmentResult(sb, auth.user.id)
-        const profile = await fetchProfile(sb, auth.user.id)
+        // These rows are RLS-scoped to `auth.uid() = id`, so read them with the
+        // token this sign-in just issued. With only the anon key configured the
+        // anonymous client sees no profile at all (`has_onboarding: false`), and
+        // every returning student was pushed back through /onboarding.
+        const asUser = getClientForToken(auth.access_token) || sb
+        const hasAssessment = await hasAssessmentResult(asUser, auth.user.id)
+        const profile = await fetchProfile(asUser, auth.user.id)
         return NextResponse.json({
           access_token: auth.access_token,
           refresh_token: auth.refresh_token,
